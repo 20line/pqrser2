@@ -1,0 +1,72 @@
+# fundarb configuration.
+#
+# Encodes the five decisions from "Что предстоит решить":
+#   1. universe:      broad coverage filtered by volume (not a fixed shortlist
+#                      of large-cap pairs only) — universe.mode: volume_filter
+#   2. entry_apr:      no single "correct" number exists a priori, so the
+#                      threshold is a config knob tuned from the Phase 2
+#                      research output (research/yield_calc.py), not a
+#                      hardcoded constant. Start conservative; raise/lower
+#                      after seeing the net-APR distribution across the
+#                      scanned universe.
+#   3. exit_rule:      both rules are implemented (backtest/strategy.py);
+#                      pick one per deployment via exit_rule.mode.
+#   4. hosting:        see deploy/README.md — local machine in Moscow for
+#                      now, VPS in the exchange's region later. Nothing in
+#                      this config depends on where the process runs.
+#   5. delta_rebalance: automatic (risk/guard.py rebalances instead of only
+#                      alerting) — rebalance.mode: auto.
+
+universe:
+  venues: [binance, bybit]
+  quote_currencies: [USDT]
+  mode: volume_filter        # broad coverage, cut by liquidity, not a fixed list
+  min_24h_quote_volume_usd: 20_000_000
+  min_contract_age_days: 30  # avoid freshly-listed / soon-to-be-delisted contracts
+  max_spread_bps: 5          # spot/perp quoted spread ceiling for entry
+  exclude_symbols: []
+
+entry:
+  min_net_apr_pct: 15.0      # conservative starting threshold; re-tune after Phase 2
+  min_history_days: 90       # require enough rate history to trust stability stats
+  max_negative_period_share: 0.25
+  max_funding_drawdown_pct: 5.0
+
+exit_rule:
+  mode: fixed_profit         # fixed_profit | rate_reversal
+  fixed_profit:
+    target_pct_of_notional: 0.6
+  rate_reversal:
+    consecutive_negative_periods: 3
+    min_negative_rate_pct: 0.0
+
+rebalance:
+  mode: auto                 # auto | alert_only
+  max_delta_deviation_pct: 1.0   # of notional; breach triggers rebalance
+  min_rebalance_interval_sec: 300
+  max_rebalance_notional_pct: 50.0  # of position notional, per rebalance step
+
+risk:
+  max_position_notional_usd: 5_000
+  max_total_exposure_usd: 20_000
+  max_leverage: 2.0
+  daily_loss_limit_usd: 500
+  max_orders_per_minute: 20
+  leg_fill_timeout_sec: 10
+
+fees:
+  binance:
+    spot_taker_bps: 10
+    spot_maker_bps: 8
+    perp_taker_bps: 5
+    perp_maker_bps: 2
+  bybit:
+    spot_taker_bps: 10
+    spot_maker_bps: 8
+    perp_taker_bps: 6
+    perp_maker_bps: 1
+
+monitor:
+  telegram_enabled: false
+  connection_loss_alert_sec: 60
+  margin_alert_ratio: 0.3
