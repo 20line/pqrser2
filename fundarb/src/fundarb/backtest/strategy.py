@@ -80,12 +80,31 @@ class CarryStrategy(Strategy):
         one noisy print).
     """
 
-    def __init__(self, entry_cfg: EntryConfig, exit_cfg: ExitRuleConfig, position_notional: Decimal) -> None:
+    def __init__(
+        self,
+        entry_cfg: EntryConfig,
+        exit_cfg: ExitRuleConfig,
+        position_notional: Decimal,
+        max_spread_bps: Decimal | None = None,
+    ) -> None:
         self.entry_cfg = entry_cfg
         self.exit_cfg = exit_cfg
         self.position_notional = position_notional
+        # None disables the check (used by tests that don't care about it);
+        # real deployments pass config.universe.max_spread_bps.
+        self.max_spread_bps = max_spread_bps
 
     def decide_entry(self, *, net_apr_estimate_pct: Decimal, basis_bps: Decimal) -> EntryDecision:
+        """Basis width is checked here, not only in the scanner: the
+        scanner's view can be stale by the time an entry actually fires, and
+        the spec's own risk table lists "basis accounted for in the entry
+        condition" as the mitigation for basis-convergence risk.
+        """
+        if self.max_spread_bps is not None and abs(basis_bps) > self.max_spread_bps:
+            return EntryDecision(
+                should_enter=False,
+                reason=f"basis {basis_bps:.1f}bps exceeds max_spread_bps={self.max_spread_bps}",
+            )
         if net_apr_estimate_pct < self.entry_cfg.min_net_apr_pct:
             return EntryDecision(
                 should_enter=False,

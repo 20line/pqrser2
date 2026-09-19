@@ -51,6 +51,7 @@ risk:
   max_total_exposure_usd: 20_000
   max_leverage: 2.0
   daily_loss_limit_usd: 500
+  max_unrealized_loss_usd: 300  # position-level stop-loss, checked every cycle
   max_orders_per_minute: 20
   leg_fill_timeout_sec: 10
 

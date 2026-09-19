@@ -13,6 +13,7 @@ from fundarb.core.models import Balances, FundingRate, Position, Quote
 from fundarb.core.types import ExitRuleMode, IntentReason, Market, OrderSide, Venue
 from fundarb.execution.executor import TwoLegExecutor
 from fundarb.execution.journal import PositionJournal
+from fundarb.execution.ledger import TradeLedger
 from fundarb.execution.live_runner import LiveRunner
 from fundarb.monitor.metrics import MetricsRegistry
 from fundarb.risk.guard import RiskGuard
@@ -62,7 +63,10 @@ def _build_runner(
     risk = RiskGuard(fundarb_config.risk, fundarb_config.rebalance)
     executor = TwoLegExecutor(adapter, risk, leg_fill_timeout_sec=fundarb_config.risk.leg_fill_timeout_sec)
     strategy = CarryStrategy(
-        fundarb_config.entry, exit_rule or fundarb_config.exit_rule, fundarb_config.risk.max_position_notional_usd
+        fundarb_config.entry,
+        exit_rule or fundarb_config.exit_rule,
+        fundarb_config.risk.max_position_notional_usd,
+        fundarb_config.universe.max_spread_bps,
     )
     alerter = RecordingAlerter()
     runner = LiveRunner(
@@ -77,6 +81,7 @@ def _build_runner(
         alerter=alerter,
         metrics=MetricsRegistry(),
         journal=PositionJournal(tmp_path / "data"),
+        ledger=TradeLedger(tmp_path / "data"),
     )
     return runner, storage, alerter
 
@@ -197,6 +202,75 @@ async def test_fixed_profit_exit_closes_position(tmp_path, fundarb_config) -> No
     assert adapter.placed_intents[-1].reason is IntentReason.EXIT_LEG1
     assert adapter.placed_intents[-1].market is Market.SPOT
 
+    ledger_rows = runner.ledger.read_all()
+    assert ledger_rows.height == 1
+    row = ledger_rows.row(0, named=True)
+    assert row["exit_reason"] == IntentReason.EXIT_LEG1.value
+    assert Decimal(row["funding_pnl"]) == Decimal("35.0")  # 2 * 0.0035 * 5000
+    assert Decimal(row["basis_pnl"]) == Decimal(0)  # quotes never moved
+    assert Decimal(row["realized_pnl"]) == Decimal("35.0")
+
+
+@pytest.mark.asyncio
+async def test_margin_low_alert_fires_below_threshold(tmp_path, fundarb_config) -> None:
+    adapter = FakeAdapter(
+        fill_responses=[filled_ack(_VENUE, "entry-leg1", "0.1"), filled_ack(_VENUE, "entry-leg2", "0.1")],
+        quotes=_quotes(),
+        funding_history=[],
+        perp_margin_balance=Decimal("100000"),  # plenty for the leverage check at entry
+    )
+    runner, storage, alerter = _build_runner(tmp_path, fundarb_config, adapter)
+    storage.write_funding_rates(_high_yield_rates())
+
+    await runner.start()
+    await runner.run_once()
+    assert runner.position is not None
+
+    # margin drops to 10% of the 5000 notional -> below margin_alert_ratio=0.3
+    adapter.perp_margin_balance = Decimal("500")
+    await runner.run_once()
+
+    assert any(call[0] == "margin_low" for call in alerter.calls)
+    metrics = runner.metrics.positions[(_VENUE, _SYMBOL)]
+    assert metrics.margin_ratio == Decimal("500") / Decimal("5000")
+
+
+@pytest.mark.asyncio
+async def test_rate_reversal_alert_fires_regardless_of_exit_rule_mode(tmp_path, fundarb_config) -> None:
+    """fixed_profit is the default exit rule here — the alert must still
+    fire on a negative funding print even though the strategy won't exit
+    on it alone.
+    """
+    adapter = FakeAdapter(
+        fill_responses=[filled_ack(_VENUE, "entry-leg1", "0.1"), filled_ack(_VENUE, "entry-leg2", "0.1")],
+        quotes=_quotes(),
+        funding_history=[],
+    )
+    runner, storage, alerter = _build_runner(tmp_path, fundarb_config, adapter)
+    storage.write_funding_rates(_high_yield_rates())
+
+    await runner.start()
+    await runner.run_once()
+    assert runner.position is not None
+    entry_time = runner.position.entry_time
+
+    storage.write_funding_rates(
+        [
+            FundingRate(
+                venue=_VENUE,
+                symbol=_SYMBOL,
+                funding_time=entry_time + timedelta(seconds=1),
+                rate=Decimal("-0.0001"),
+                interval_hours=8,
+                mark_price=_SPOT_PRICE,
+            )
+        ]
+    )
+    await runner.run_once()
+
+    assert runner.position is not None  # fixed_profit: this alone doesn't trigger an exit
+    assert any(call[0] == "rate_reversal" for call in alerter.calls)
+
 
 @pytest.mark.asyncio
 async def test_rate_reversal_exit_closes_position(tmp_path, fundarb_config, entry_config) -> None:
@@ -243,12 +317,18 @@ async def test_rate_reversal_exit_closes_position(tmp_path, fundarb_config, entr
 
 
 @pytest.mark.asyncio
-async def test_auto_delta_rebalance_trims_oversized_leg(tmp_path, fundarb_config) -> None:
+async def test_stop_loss_forces_close_on_unrealized_loss(tmp_path, fundarb_config) -> None:
+    """max_unrealized_loss_usd fires on basis drag alone, with zero funding
+    events applied and the strategy's own exit rule nowhere close to
+    triggering — this is a position-level guard independent of the
+    strategy's exit logic.
+    """
     adapter = FakeAdapter(
         fill_responses=[
             filled_ack(_VENUE, "entry-leg1", "0.1"),
             filled_ack(_VENUE, "entry-leg2", "0.1"),
-            filled_ack(_VENUE, "rebalance", "0.02"),
+            filled_ack(_VENUE, "stop-leg1", "0.1"),
+            filled_ack(_VENUE, "stop-leg2", "0.1"),
         ],
         quotes=_quotes(),
         funding_history=[],
@@ -260,8 +340,43 @@ async def test_auto_delta_rebalance_trims_oversized_leg(tmp_path, fundarb_config
     await runner.run_once()
     assert runner.position is not None
 
-    # perp price jumps: perp notional 0.1*60000=6000 vs spot 0.1*50000=5000 -> 16.7% deviation
-    adapter.quotes = _quotes(spot=_SPOT_PRICE, perp=Decimal("60000"))
+    # perp blows out to 56000: basis_pnl ~= -601, past max_unrealized_loss_usd=300
+    adapter.quotes = _quotes(spot=_SPOT_PRICE, perp=Decimal("56000"))
+
+    await runner.run_once()
+
+    assert runner.position is None
+    assert runner.journal.load(_VENUE, _SYMBOL) is None
+    assert len(adapter.placed_intents) == 4
+    assert adapter.placed_intents[-1].reason is IntentReason.STOP_LOSS_CLOSE
+    assert any(call[0] == "send" and "stop-loss triggered" in call[1][0] for call in alerter.calls)
+    # the ~$601 realized loss also breaches daily_loss_limit_usd=500 ->
+    # record_realized_pnl chains into the kill switch, blocking new entries
+    assert runner.risk.kill_switch_active
+
+
+@pytest.mark.asyncio
+async def test_auto_delta_rebalance_trims_oversized_leg(tmp_path, fundarb_config) -> None:
+    adapter = FakeAdapter(
+        fill_responses=[
+            filled_ack(_VENUE, "entry-leg1", "0.1"),
+            filled_ack(_VENUE, "entry-leg2", "0.1"),
+            filled_ack(_VENUE, "rebalance", "0.002"),
+        ],
+        quotes=_quotes(),
+        funding_history=[],
+    )
+    runner, storage, alerter = _build_runner(tmp_path, fundarb_config, adapter)
+    storage.write_funding_rates(_high_yield_rates())
+
+    await runner.start()
+    await runner.run_once()
+    assert runner.position is not None
+
+    # perp price moves 2%: perp notional 0.1*51000=5100 vs spot 0.1*50000=5000 ->
+    # 1.96% deviation (clears the 1% rebalance bar) while the basis-driven
+    # unrealized loss (~$100) stays well under the $300 stop-loss bar.
+    adapter.quotes = _quotes(spot=_SPOT_PRICE, perp=Decimal("51000"))
 
     await runner.run_once()
 
@@ -269,7 +384,7 @@ async def test_auto_delta_rebalance_trims_oversized_leg(tmp_path, fundarb_config
     rebalance_intent = adapter.placed_intents[-1]
     assert rebalance_intent.reason is IntentReason.DELTA_REBALANCE
     assert rebalance_intent.side is OrderSide.BUY  # spot was the undersized leg relative to perp
-    assert runner.position.spot_qty == Decimal("0.12")
+    assert runner.position.spot_qty == Decimal("0.102")
     assert any(call[0] == "delta_out_of_tolerance" and call[1][2] is True for call in alerter.calls)
 
 
@@ -343,7 +458,9 @@ async def test_position_metadata_survives_restart(tmp_path, fundarb_config) -> N
     storage1.write_funding_rates(_high_yield_rates())
     risk1 = RiskGuard(fundarb_config.risk, fundarb_config.rebalance)
     executor1 = TwoLegExecutor(adapter1, risk1, leg_fill_timeout_sec=fundarb_config.risk.leg_fill_timeout_sec)
-    strategy1 = CarryStrategy(fundarb_config.entry, fundarb_config.exit_rule, fundarb_config.risk.max_position_notional_usd)
+    strategy1 = CarryStrategy(
+        fundarb_config.entry, fundarb_config.exit_rule, fundarb_config.risk.max_position_notional_usd, fundarb_config.universe.max_spread_bps
+    )
     runner1 = LiveRunner(
         venue=_VENUE,
         symbol=_SYMBOL,
@@ -356,6 +473,7 @@ async def test_position_metadata_survives_restart(tmp_path, fundarb_config) -> N
         alerter=RecordingAlerter(),
         metrics=MetricsRegistry(),
         journal=PositionJournal(data_dir),
+        ledger=TradeLedger(data_dir),
     )
     await runner1.start()
     await runner1.run_once()
@@ -384,7 +502,9 @@ async def test_position_metadata_survives_restart(tmp_path, fundarb_config) -> N
     storage2 = ParquetStorage(data_dir)
     risk2 = RiskGuard(fundarb_config.risk, fundarb_config.rebalance)
     executor2 = TwoLegExecutor(adapter2, risk2, leg_fill_timeout_sec=fundarb_config.risk.leg_fill_timeout_sec)
-    strategy2 = CarryStrategy(fundarb_config.entry, fundarb_config.exit_rule, fundarb_config.risk.max_position_notional_usd)
+    strategy2 = CarryStrategy(
+        fundarb_config.entry, fundarb_config.exit_rule, fundarb_config.risk.max_position_notional_usd, fundarb_config.universe.max_spread_bps
+    )
     runner2 = LiveRunner(
         venue=_VENUE,
         symbol=_SYMBOL,
@@ -397,6 +517,7 @@ async def test_position_metadata_survives_restart(tmp_path, fundarb_config) -> N
         alerter=RecordingAlerter(),
         metrics=MetricsRegistry(),
         journal=PositionJournal(data_dir),
+        ledger=TradeLedger(data_dir),
     )
     await runner2.start()
 

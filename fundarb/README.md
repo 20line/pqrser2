@@ -117,6 +117,42 @@ signed quantity), the old check flagged every healthy position as
 single-legged. Both are covered by
 `test_live_runner.py::test_position_metadata_survives_restart`.
 
+A second pass closed four more gaps, all in `LiveRunner`:
+
+- **Position-level stop-loss.** `risk.max_unrealized_loss_usd` is checked
+  every cycle against funding PnL *and* basis drag combined
+  (`_pnl_breakdown`), independent of whichever exit rule the deployment
+  picked — a `rate_reversal` deployment sitting on a positive rate but a
+  blown-out basis would otherwise never exit. A breach forces an immediate
+  close (`IntentReason.STOP_LOSS_CLOSE`), which can itself cascade into
+  `daily_loss_limit_usd` tripping the kill switch, same as any other
+  realized loss.
+- **`margin_low` and `rate_reversal` alerts are wired**, not just declared
+  on `TelegramAlerter`. Margin ratio (`get_perp_margin_balance` / position
+  notional) is checked every cycle against `monitor.margin_alert_ratio`;
+  a negative funding print fires `rate_reversal` regardless of
+  `exit_rule.mode` — a `fixed_profit` deployment still gets told the edge
+  went negative even though it won't exit on that alone.
+- **`MetricsRegistry` is actually populated.** It existed with nothing
+  calling `update_position()`; now every cycle with an open position
+  writes accumulated funding, basis, delta, and margin ratio into it.
+- **`execution/ledger.py` — an append-only trade ledger.** One parquet row
+  per closed position (entry/exit time and basis, funding PnL, basis PnL,
+  realized PnL, exit reason), written by the same `_execute_close` helper
+  every closing path (normal exit, stop-loss, kill switch) shares. This is
+  the spec's "full journal from day one, in a format fit for reporting" —
+  previously the only record of a closed trade was a structlog line.
+  Fixed a real bug along the way: realized PnL recorded to the daily-loss
+  tracker only ever counted funding, never basis drag, understating losses
+  from basis moves.
+- **Basis is checked at the moment of entry, not only in the scanner.**
+  `CarryStrategy.decide_entry` used to accept `basis_bps` and silently
+  ignore it — the scanner's basis snapshot can be stale by the time an
+  entry actually fires. `CarryStrategy` now takes an optional
+  `max_spread_bps` (wired from `config.universe.max_spread_bps`) and
+  rejects entries whose basis is too wide, directly implementing the
+  spec's risk-table row for basis-convergence risk.
+
 ## Setup
 
 ```bash
@@ -156,10 +192,12 @@ the risk guard (position/exposure limits, order-frequency limiting, kill
 switch, auto delta-rebalance), the two-leg executor (partial fills,
 rollback on leg-2 failure, rollback-failure escalating to the kill switch),
 idempotent parquet storage, the scanner's liquidity filter (both legs, not
-just spot), and the live runner end to end against a fake adapter (entry,
-both exit rules, auto rebalance, kill-switch auto-close, connection-loss
-alerting, and position persistence across a simulated restart). CI runs the
-suite on every push/PR touching `fundarb/**`
+just spot), and the live runner end to end against a fake adapter — entry
+(including the basis filter and leverage check), both exit rules, the
+position-level stop-loss (and its cascade into the daily-loss kill switch),
+auto rebalance, kill-switch auto-close, margin/rate-reversal alerting, the
+trade ledger, and position persistence across a simulated restart. CI runs
+the suite on every push/PR touching `fundarb/**`
 (`.github/workflows/fundarb-tests.yml`).
 
 ## Known limitations (carried over from the spec)
@@ -168,11 +206,13 @@ suite on every push/PR touching `fundarb/**`
   synthetic and book depth is nominal. Testnet is for mechanics (orders,
   reconnects, reconciliation, restart behavior); yield numbers only mean
   anything computed from mainnet history via the public endpoints.
-- **No automatic margin top-up.** The risk guard enforces a leverage
-  *ceiling* (`risk.max_leverage`, checked before every entry) but doesn't
-  add margin automatically as price moves against the perp leg — the
-  spec's risk table lists auto-top-up as one mitigation for liquidation
-  risk; today that's still a manual/alert-driven response.
+- **No automatic margin top-up.** `risk.max_leverage` is enforced as a
+  ceiling before every entry, `monitor.margin_alert_ratio` now alerts when
+  margin runs low, and `risk.max_unrealized_loss_usd` forces a close before
+  losses compound — but nothing adds margin automatically as price moves
+  against the perp leg. The spec's risk table lists auto-top-up as one
+  mitigation for liquidation risk; today the response is stop-loss-then-
+  alert, not top-up.
 - **Single symbol per `LiveRunner`.** Fine for Phase 5 ("one pair, minimal
   size"), but risk limits (`max_total_exposure_usd`, order-frequency) are
   only accurate as long as nothing else trades against the same

@@ -34,6 +34,25 @@ def test_decide_entry_accepts_at_or_above_threshold(entry_config, exit_rule_conf
     assert decision.notional == Decimal(5000)
 
 
+def test_decide_entry_rejects_basis_wider_than_max_spread(entry_config, exit_rule_config) -> None:
+    strategy = CarryStrategy(entry_config, exit_rule_config, Decimal(5000), Decimal(5))
+    decision = strategy.decide_entry(net_apr_estimate_pct=Decimal("50"), basis_bps=Decimal("12"))
+    assert not decision.should_enter
+    assert "basis" in decision.reason
+
+
+def test_decide_entry_accepts_basis_within_max_spread(entry_config, exit_rule_config) -> None:
+    strategy = CarryStrategy(entry_config, exit_rule_config, Decimal(5000), Decimal(5))
+    decision = strategy.decide_entry(net_apr_estimate_pct=Decimal("50"), basis_bps=Decimal("-3"))
+    assert decision.should_enter
+
+
+def test_decide_entry_max_spread_none_disables_basis_check(entry_config, exit_rule_config) -> None:
+    strategy = CarryStrategy(entry_config, exit_rule_config, Decimal(5000))  # max_spread_bps defaults to None
+    decision = strategy.decide_entry(net_apr_estimate_pct=Decimal("50"), basis_bps=Decimal("9999"))
+    assert decision.should_enter
+
+
 def test_on_funding_event_accumulates_pnl_and_tracks_streak(entry_config) -> None:
     exit_cfg = ExitRuleConfig(
         mode=ExitRuleMode.RATE_REVERSAL,

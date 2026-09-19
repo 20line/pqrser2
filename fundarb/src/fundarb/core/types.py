@@ -52,6 +52,7 @@ class IntentReason(StrEnum):
     EXIT_LEG2 = "exit_leg2"
     DELTA_REBALANCE = "delta_rebalance"
     KILL_SWITCH_CLOSE = "kill_switch_close"
+    STOP_LOSS_CLOSE = "stop_loss_close"
 
 
 class RiskDecision(StrEnum):

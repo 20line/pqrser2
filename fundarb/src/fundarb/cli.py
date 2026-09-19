@@ -26,6 +26,7 @@ from fundarb.exchanges.binance import BinanceAdapter
 from fundarb.exchanges.bybit import BybitAdapter
 from fundarb.execution.executor import TwoLegExecutor
 from fundarb.execution.journal import PositionJournal
+from fundarb.execution.ledger import TradeLedger
 from fundarb.execution.live_runner import LiveRunner
 from fundarb.monitor.alerts import TelegramAlerter
 from fundarb.monitor.metrics import MetricsRegistry
@@ -123,7 +124,9 @@ def backtest(ctx: click.Context, venue: str, symbol: str, start: str, end: str |
     config: FundarbConfig = ctx.obj["config"]
     storage = ParquetStorage(data_dir)
     engine = BacktestEngine(config, storage)
-    strategy = CarryStrategy(config.entry, config.exit_rule, config.risk.max_position_notional_usd)
+    strategy = CarryStrategy(
+        config.entry, config.exit_rule, config.risk.max_position_notional_usd, config.universe.max_spread_bps
+    )
     start_dt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
     end_dt = datetime.fromisoformat(end).replace(tzinfo=timezone.utc) if end else datetime.now(timezone.utc)
 
@@ -177,7 +180,9 @@ async def _run(
     risk = RiskGuard(config.risk, config.rebalance)
     alerter = TelegramAlerter(secrets, enabled=config.monitor.telegram_enabled)
     executor = TwoLegExecutor(adapter, risk, leg_fill_timeout_sec=config.risk.leg_fill_timeout_sec)
-    strategy = CarryStrategy(config.entry, config.exit_rule, config.risk.max_position_notional_usd)
+    strategy = CarryStrategy(
+        config.entry, config.exit_rule, config.risk.max_position_notional_usd, config.universe.max_spread_bps
+    )
 
     runner = LiveRunner(
         venue=venue,
@@ -191,6 +196,7 @@ async def _run(
         alerter=alerter,
         metrics=MetricsRegistry(),
         journal=PositionJournal(data_dir),
+        ledger=TradeLedger(data_dir),
     )
     try:
         await runner.start()

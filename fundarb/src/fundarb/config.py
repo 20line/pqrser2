@@ -62,6 +62,11 @@ class RiskConfig(BaseModel):
     max_total_exposure_usd: Decimal = Decimal("20000")
     max_leverage: Decimal = Decimal("2.0")
     daily_loss_limit_usd: Decimal = Decimal("500")
+    # Position-level stop-loss on unrealized PnL (funding + basis drag),
+    # checked every cycle. Deliberately tighter than daily_loss_limit_usd:
+    # this closes ONE bad position before it alone could exhaust the day's
+    # account-wide loss budget.
+    max_unrealized_loss_usd: Decimal = Decimal("300")
     max_orders_per_minute: int = 20
     leg_fill_timeout_sec: int = 10
 

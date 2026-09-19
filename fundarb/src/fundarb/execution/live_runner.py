@@ -22,6 +22,14 @@ adapter instead of only exercisable by actually running the CLI:
 Position metadata (entry_time, entry_basis, funding/streak counters) is
 persisted via `execution/journal.py` after every cycle that touches it, so
 a restart recovers exact state instead of approximating "now".
+
+On top of that: a position-level stop-loss (`risk.max_unrealized_loss_usd`)
+forces a close independent of whatever the strategy's own exit rule says;
+`MetricsRegistry` is actually populated every cycle (accumulated funding,
+basis, delta, margin) instead of sitting unused; `margin_low` and
+`rate_reversal` alerts fire per the spec's monitor requirements; and every
+closed position is appended to `execution/ledger.py`'s trade ledger —
+the "full journal from day one" the spec requires for tax reporting.
 """
 
 from __future__ import annotations
@@ -42,6 +50,7 @@ from fundarb.exchanges.base import ExchangeAdapter
 from fundarb.exchanges.symbols import split
 from fundarb.execution.executor import TwoLegExecutor
 from fundarb.execution.journal import PositionJournal
+from fundarb.execution.ledger import LedgerEntry, TradeLedger
 from fundarb.execution.reconcile import reconcile
 from fundarb.monitor.alerts import TelegramAlerter
 from fundarb.monitor.metrics import MetricsRegistry
@@ -69,6 +78,7 @@ class LiveRunner:
     alerter: TelegramAlerter
     metrics: MetricsRegistry
     journal: PositionJournal
+    ledger: TradeLedger
 
     def __post_init__(self) -> None:
         self._collector = HistoryCollector(self.adapter, self.storage)
@@ -161,9 +171,12 @@ class LiveRunner:
             await self._try_enter(spot_quote, perp_quote, basis, epoch_key)
         else:
             await self._apply_funding_events()
-            await self._maybe_rebalance(spot_quote, perp_quote, epoch_key)
-            if self.position is not None:  # rebalance never closes the position
-                await self._maybe_exit(basis, spot_quote, perp_quote, epoch_key)
+            await self._monitor_position(basis, spot_quote, perp_quote)
+            stopped_out = await self._check_stop_loss(basis, spot_quote, perp_quote, epoch_key)
+            if not stopped_out:
+                await self._maybe_rebalance(spot_quote, perp_quote, epoch_key)
+                if self.position is not None:  # rebalance never closes the position
+                    await self._maybe_exit(basis, spot_quote, perp_quote, epoch_key)
 
         if self.position is not None:
             self.journal.save(self.position)
@@ -243,6 +256,42 @@ class LiveRunner:
                 self.strategy.on_funding_event(self.position, r.rate)
                 self.position.last_applied_funding_time = r.funding_time
                 high_water = r.funding_time
+                if r.rate < 0:
+                    # fires regardless of exit_rule.mode — an operator on
+                    # fixed_profit still wants to know the edge is gone even
+                    # if the strategy itself won't exit on this alone
+                    await self.alerter.rate_reversal(self.symbol, float(r.rate * 100))
+
+    async def _monitor_position(self, basis: Decimal, spot_quote, perp_quote) -> None:
+        """Populates MetricsRegistry (previously constructed but never
+        written to during a live run) and fires margin_low once free perp
+        margin drops below monitor.margin_alert_ratio of the position's
+        notional.
+        """
+        assert self.position is not None
+        spot_notional = self.position.spot_qty * spot_quote.mid
+        perp_notional = self.position.perp_qty * perp_quote.mid
+        larger = max(spot_notional, perp_notional)
+        delta_ratio = abs(spot_notional - perp_notional) / larger if larger else Decimal(0)
+
+        _, quote_asset = split(self.symbol)
+        try:
+            margin = await self.adapter.get_perp_margin_balance(quote_asset)
+        except ExchangeAdapterError as exc:
+            log.warning("failed to read margin balance for monitoring", symbol=self.symbol, error=str(exc))
+            return
+        margin_ratio = margin / self.position.notional if self.position.notional else Decimal(0)
+
+        self.metrics.update_position(
+            self.venue,
+            self.symbol,
+            accumulated_funding=self.position.cumulative_funding_pnl,
+            current_basis_bps=basis * 10_000,
+            delta_notional_ratio=delta_ratio,
+            margin_ratio=margin_ratio,
+        )
+        if margin_ratio < self.config.monitor.margin_alert_ratio:
+            await self.alerter.margin_low(self.symbol, float(margin_ratio))
 
     async def _maybe_rebalance(self, spot_quote, perp_quote, epoch_key: str) -> None:
         assert self.position is not None
@@ -275,41 +324,112 @@ class LiveRunner:
         elif decision.should_alert:
             await self.alerter.delta_out_of_tolerance(self.symbol, float(decision.deviation_pct), False)
 
-    async def _maybe_exit(self, basis: Decimal, spot_quote, perp_quote, epoch_key: str) -> None:
+    def _pnl_breakdown(self, basis: Decimal) -> tuple[Decimal, Decimal, Decimal]:
+        """Returns (funding_pnl, basis_pnl, total) as of `basis` — used both
+        for the stop-loss check (unrealized, position still open) and for
+        recording/journaling realized PnL once a close actually fills.
+        """
         assert self.position is not None
-        decision = self.strategy.decide_exit(self.position, current_basis=basis, latest_rate=Decimal(0))
-        if not decision.should_exit:
-            return
+        funding_pnl = self.position.cumulative_funding_pnl
+        basis_pnl = -(basis - self.position.entry_basis) * self.position.notional
+        return funding_pnl, basis_pnl, funding_pnl + basis_pnl
+
+    def _unrealized_pnl(self, basis: Decimal) -> Decimal:
+        return self._pnl_breakdown(basis)[2]
+
+    async def _execute_close(
+        self, spot_quote, perp_quote, basis: Decimal, epoch_key: str, reason: IntentReason
+    ) -> bool:
+        """Shared by every closing path (normal exit, stop-loss, kill
+        switch) so realized PnL is recorded consistently — funding AND
+        basis drag, not funding alone — and every close lands in the trade
+        ledger, not just structlog output.
+        """
+        assert self.position is not None
+        position = self.position
         result = await self.executor.execute(
             symbol=self.symbol,
             leg1_market=Market.PERP,
             leg1_side=OrderSide.BUY,
             leg2_market=Market.SPOT,
             leg2_side=OrderSide.SELL,
-            quantity=self.position.perp_qty,
+            quantity=position.perp_qty,
             price_leg1=perp_quote.ask,
             price_leg2=spot_quote.bid,
-            reason=IntentReason.EXIT_LEG1,
+            reason=reason,
             epoch_key=epoch_key,
-            current_position_notional_usd=self.position.notional,
-            total_exposure_usd=self.position.notional,
+            current_position_notional_usd=position.notional,
+            total_exposure_usd=position.notional,
             reduce_only=True,
         )
-        if result.success:
-            self.risk.record_realized_pnl(self.position.cumulative_funding_pnl)
-            log.info("exited position", symbol=self.symbol, reason=decision.reason)
-            self.journal.clear(self.venue, self.symbol)
-            self.position = None
-        else:
-            log.error("exit failed", symbol=self.symbol, reason=result.reason)
+        if not result.success:
+            log.error("position close failed", symbol=self.symbol, reason=reason.value, error=result.reason)
+            return False
+
+        funding_pnl, basis_pnl, realized_pnl = self._pnl_breakdown(basis)
+        self.risk.record_realized_pnl(realized_pnl)
+        exit_time = datetime.now(timezone.utc)
+        self.ledger.append(
+            LedgerEntry(
+                venue=self.venue,
+                symbol=self.symbol,
+                entry_time=position.entry_time,
+                exit_time=exit_time,
+                entry_basis=position.entry_basis,
+                exit_basis=basis,
+                notional=position.notional,
+                funding_pnl=funding_pnl,
+                basis_pnl=basis_pnl,
+                realized_pnl=realized_pnl,
+                exit_reason=reason.value,
+            )
+        )
+        log.info("position closed", symbol=self.symbol, reason=reason.value, realized_pnl=str(realized_pnl))
+        self.journal.clear(self.venue, self.symbol)
+        self.position = None
+        return True
+
+    async def _maybe_exit(self, basis: Decimal, spot_quote, perp_quote, epoch_key: str) -> None:
+        assert self.position is not None
+        decision = self.strategy.decide_exit(self.position, current_basis=basis, latest_rate=Decimal(0))
+        if not decision.should_exit:
+            return
+        await self._execute_close(spot_quote, perp_quote, basis, epoch_key, IntentReason.EXIT_LEG1)
+
+    # ---- stop-loss ----------------------------------------------------
+
+    async def _check_stop_loss(self, basis: Decimal, spot_quote, perp_quote, epoch_key: str) -> bool:
+        """Position-level stop-loss on unrealized PnL, independent of
+        whatever the strategy's exit rule says. Returns True if a
+        stop-loss close was executed (caller skips the normal rebalance
+        and exit logic that cycle).
+        """
+        assert self.position is not None
+        unrealized_pnl = self._unrealized_pnl(basis)
+        if unrealized_pnl > -self.config.risk.max_unrealized_loss_usd:
+            return False
+
+        log.error(
+            "stop-loss triggered",
+            symbol=self.symbol,
+            unrealized_pnl=str(unrealized_pnl),
+            max_unrealized_loss_usd=str(self.config.risk.max_unrealized_loss_usd),
+        )
+        await self.alerter.send(
+            f"🚨 {self.symbol}: stop-loss triggered, unrealized PnL {unrealized_pnl:.2f} — closing position"
+        )
+        closed = await self._execute_close(spot_quote, perp_quote, basis, epoch_key, IntentReason.STOP_LOSS_CLOSE)
+        if not closed:
+            await self.alerter.send(f"🚨 {self.symbol}: stop-loss close FAILED — will retry next cycle")
+        return closed
 
     # ---- kill switch ------------------------------------------------------
 
     async def _emergency_close(self, epoch_key: str) -> None:
         assert self.position is not None
         try:
-            perp_quote = await self.adapter.get_quote(self.symbol, Market.PERP)
             spot_quote = await self.adapter.get_quote(self.symbol, Market.SPOT)
+            perp_quote = await self.adapter.get_quote(self.symbol, Market.PERP)
         except ExchangeAdapterError as exc:
             log.critical(
                 "cannot fetch quotes to execute kill-switch close — will retry next cycle",
@@ -318,34 +438,18 @@ class LiveRunner:
             )
             return
 
-        result = await self.executor.execute(
-            symbol=self.symbol,
-            leg1_market=Market.PERP,
-            leg1_side=OrderSide.BUY,
-            leg2_market=Market.SPOT,
-            leg2_side=OrderSide.SELL,
-            quantity=self.position.perp_qty,
-            price_leg1=perp_quote.ask,
-            price_leg2=spot_quote.bid,
-            reason=IntentReason.KILL_SWITCH_CLOSE,
-            epoch_key=epoch_key,
-            current_position_notional_usd=self.position.notional,
-            total_exposure_usd=self.position.notional,
-            reduce_only=True,
-        )
-        if result.success:
+        basis = basis_fraction(spot_quote.mid, perp_quote.mid)
+        closed = await self._execute_close(spot_quote, perp_quote, basis, epoch_key, IntentReason.KILL_SWITCH_CLOSE)
+        if closed:
             log.warning("kill-switch close succeeded", symbol=self.symbol)
-            self.journal.clear(self.venue, self.symbol)
-            self.position = None
             await self.alerter.send(f"🛑 {self.symbol}: kill-switch close succeeded, both legs closed")
         else:
             log.critical(
                 "kill-switch close FAILED — position may still be open, manual intervention required",
                 symbol=self.symbol,
-                reason=result.reason,
             )
             await self.alerter.send(
-                f"🚨 {self.symbol}: kill-switch close FAILED ({result.reason}) — manual intervention required"
+                f"🚨 {self.symbol}: kill-switch close FAILED — manual intervention required"
             )
 
     # ---- connection health --------------------------------------------------
