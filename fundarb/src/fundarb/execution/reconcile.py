@@ -16,6 +16,7 @@ from fundarb.core.errors import ReconciliationError
 from fundarb.core.models import Order
 from fundarb.core.types import Market, OrderSide
 from fundarb.exchanges.base import ExchangeAdapter
+from fundarb.exchanges.symbols import split
 
 log = structlog.get_logger(__name__)
 
@@ -29,27 +30,45 @@ class SymbolState:
 
     @property
     def delta_notional_ratio(self) -> Decimal:
-        """abs(spot - perp) / max(spot, perp) as a fraction; 0 = perfectly
-        hedged, 1 = fully one-legged.
+        """abs(spot - |perp|) / max(spot, |perp|) as a fraction; 0 = perfectly
+        hedged, 1 = fully one-legged. `perp_quantity` is signed (negative =
+        short, the normal hedge direction), so magnitude is what matters
+        here, not sign.
         """
-        larger = max(self.spot_quantity, self.perp_quantity)
+        perp_magnitude = abs(self.perp_quantity)
+        larger = max(self.spot_quantity, perp_magnitude)
         if larger == 0:
             return Decimal(0)
-        return abs(self.spot_quantity - self.perp_quantity) / larger
+        return abs(self.spot_quantity - perp_magnitude) / larger
 
     @property
     def is_single_legged(self) -> bool:
-        return (self.spot_quantity > 0) != (self.perp_quantity > 0)
+        """True iff exactly one leg is nonzero. A correctly hedged position
+        has spot_quantity > 0 (long) and perp_quantity < 0 (short) — using
+        `> 0` on both, as opposed to `!= 0`, would flag every healthy
+        position as single-legged.
+        """
+        return (self.spot_quantity != 0) != (self.perp_quantity != 0)
 
 
-async def reconcile(adapter: ExchangeAdapter) -> dict[str, SymbolState]:
-    """Queries the exchange for real positions/orders and builds a per-symbol
-    view. Raises ReconciliationError if the exchange calls themselves fail —
-    starting with an unknown state is worse than not starting at all.
+async def reconcile(adapter: ExchangeAdapter, symbols: list[str] | None = None) -> dict[str, SymbolState]:
+    """Queries the exchange for real positions/orders/balances and builds a
+    per-symbol view. Raises ReconciliationError if the exchange calls
+    themselves fail — starting with an unknown state is worse than not
+    starting at all.
+
+    `symbols` should list every symbol the caller trades (a single-symbol
+    LiveRunner passes its one symbol). This matters because `get_positions()`
+    is a derivatives-only endpoint on every real exchange — spot holdings
+    never show up there, they live in `get_balances()`. Without checking
+    balances explicitly, every open perp position would look single-legged
+    on every restart (spot always reading 0), which is exactly the false
+    kill-switch trip this module exists to prevent.
     """
     try:
         positions = await adapter.get_positions()
         open_orders = await adapter.get_open_orders()
+        balances = await adapter.get_balances() if symbols else None
     except Exception as exc:  # noqa: BLE001 - any failure here is fatal to startup
         raise ReconciliationError(f"{adapter.venue}: reconciliation failed: {exc}") from exc
 
@@ -58,8 +77,8 @@ async def reconcile(adapter: ExchangeAdapter) -> dict[str, SymbolState]:
     for o in open_orders:
         orders_by_symbol.setdefault(o.symbol, []).append(o)
 
-    symbols = {p.symbol for p in positions} | set(orders_by_symbol)
-    for symbol in symbols:
+    tracked_symbols = set(symbols or []) | {p.symbol for p in positions} | set(orders_by_symbol)
+    for symbol in tracked_symbols:
         spot_qty = Decimal(0)
         perp_qty = Decimal(0)
         for p in positions:
@@ -70,6 +89,12 @@ async def reconcile(adapter: ExchangeAdapter) -> dict[str, SymbolState]:
                 spot_qty += signed
             else:
                 perp_qty += signed
+        if balances is not None and symbol in (symbols or []):
+            base, _ = split(symbol)
+            # spot-account holding of the base asset; perp collateral for a
+            # USDT-margined contract lives in the quote asset, not here, so
+            # summing get_balances()'s spot+perp totals for `base` is safe
+            spot_qty = balances.total.get(base, Decimal(0))
         state = SymbolState(
             symbol=symbol,
             spot_quantity=spot_qty,

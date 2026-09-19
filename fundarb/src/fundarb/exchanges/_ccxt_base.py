@@ -199,6 +199,7 @@ class CCXTExchangeAdapter(ExchangeAdapter):
             spot_markets = await self._spot.load_markets(reload=True)
             perp_markets = await self._perp.load_markets(reload=True)
             spot_tickers = await self._spot.fetch_tickers()
+            perp_tickers = await self._perp.fetch_tickers()
         except ccxtpro.BaseError as exc:
             raise ExchangeAdapterError(f"{self.venue}: fetch_instruments failed: {exc}") from exc
 
@@ -211,7 +212,8 @@ class CCXTExchangeAdapter(ExchangeAdapter):
             spot_symbol = f"{base}/{quote}"
             if spot_symbol not in spot_markets:
                 continue
-            ticker = spot_tickers.get(spot_symbol, {})
+            spot_ticker = spot_tickers.get(spot_symbol, {})
+            perp_ticker = perp_tickers.get(perp_symbol, {})
             interval_hours = perp_info.get("info", {}).get(
                 "fundingIntervalHours", self.default_funding_interval_hours
             )
@@ -227,7 +229,8 @@ class CCXTExchangeAdapter(ExchangeAdapter):
                     qty_step=_dec(perp_info.get("precision", {}).get("amount") or "0.0001"),
                     min_qty=_dec((perp_info.get("limits", {}).get("amount") or {}).get("min") or "0"),
                     listed_at=_to_dt(int(listed_ms)) if listed_ms else None,
-                    quote_volume_24h_usd=_dec(ticker.get("quoteVolume")) if ticker else None,
+                    spot_quote_volume_24h_usd=_dec(spot_ticker.get("quoteVolume")) if spot_ticker else None,
+                    perp_quote_volume_24h_usd=_dec(perp_ticker.get("quoteVolume")) if perp_ticker else None,
                 )
             )
         return out
@@ -297,6 +300,20 @@ class CCXTExchangeAdapter(ExchangeAdapter):
             return
         except ccxtpro.BaseError as exc:
             raise ExchangeAdapterError(f"{self.venue}: cancel_order failed: {exc}") from exc
+
+    async def set_leverage(self, symbol: str, leverage: Decimal) -> None:
+        ccxt_symbol = to_ccxt_symbol(symbol, Market.PERP)
+        try:
+            await self._perp.set_leverage(float(leverage), ccxt_symbol)
+        except ccxtpro.BaseError as exc:
+            raise ExchangeAdapterError(f"{self.venue}: set_leverage failed: {exc}") from exc
+
+    async def get_perp_margin_balance(self, asset: str) -> Decimal:
+        try:
+            balance = await self._perp.fetch_balance()
+        except ccxtpro.BaseError as exc:
+            raise ExchangeAdapterError(f"{self.venue}: get_perp_margin_balance failed: {exc}") from exc
+        return _dec((balance.get("free") or {}).get(asset))
 
     async def get_positions(self) -> list[Position]:
         try:

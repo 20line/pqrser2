@@ -32,6 +32,10 @@ class OpenPosition:
     # The backtest engine never touches these — it assumes perfect hedges.
     spot_qty: Decimal = Decimal(0)
     perp_qty: Decimal = Decimal(0)
+    # Live-run only: high-water mark of the last funding event already
+    # folded into cumulative_funding_pnl. Persisted (see execution/journal.py)
+    # so a restart doesn't replay — and double-count — events already applied.
+    last_applied_funding_time: datetime | None = None
 
 
 @dataclass

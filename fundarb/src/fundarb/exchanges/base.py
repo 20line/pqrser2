@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime
+from decimal import Decimal
 
 from fundarb.core.models import (
     Balances,
@@ -65,6 +66,22 @@ class ExchangeAdapter(ABC):
 
     @abstractmethod
     async def get_balances(self) -> Balances: ...
+
+    @abstractmethod
+    async def set_leverage(self, symbol: str, leverage: Decimal) -> None:
+        """Set the perp account's leverage for `symbol` before entering.
+        Exchanges default to account-level leverage that can be far above
+        what `risk.max_leverage` allows — this must be called before the
+        first perp order for a symbol, not assumed.
+        """
+
+    @abstractmethod
+    async def get_perp_margin_balance(self, asset: str) -> Decimal:
+        """Free collateral available on the PERP account for `asset`
+        (e.g. "USDT") — kept separate from `get_balances()`, which
+        aggregates spot + perp and is therefore useless for a leverage
+        check (spot holdings aren't margin).
+        """
 
     @abstractmethod
     async def wait_for_fill(

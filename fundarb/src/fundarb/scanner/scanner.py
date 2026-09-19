@@ -31,7 +31,8 @@ class Candidate:
     raw_apr_pct: Decimal
     net_apr_estimate_pct: Decimal
     stability: RateStabilityStats
-    quote_volume_24h_usd: Decimal | None
+    spot_quote_volume_24h_usd: Decimal | None
+    perp_quote_volume_24h_usd: Decimal | None
     basis_bps: Decimal | None
     rejected_reason: str | None = None
 
@@ -122,21 +123,35 @@ class Scanner:
             raw_apr_pct=raw_apr,
             net_apr_estimate_pct=net_apr_estimate,
             stability=stability,
-            quote_volume_24h_usd=instrument.quote_volume_24h_usd,
+            spot_quote_volume_24h_usd=instrument.spot_quote_volume_24h_usd,
+            perp_quote_volume_24h_usd=instrument.perp_quote_volume_24h_usd,
             basis_bps=basis_bps,
             rejected_reason=rejected,
         )
 
     def _universe_rejection(self, instrument: Instrument) -> str | None:
+        """Both legs need to clear the liquidity bar: the perp leg is
+        usually the one that actually eats slippage on entry/exit (it's
+        where reduce/increase happens for the short side), so checking
+        spot volume alone gives a false sense of safety.
+        """
         uni = self.config.universe
         if instrument.symbol in uni.exclude_symbols:
             return "excluded by config"
         if (
-            instrument.quote_volume_24h_usd is not None
-            and instrument.quote_volume_24h_usd < uni.min_24h_quote_volume_usd
+            instrument.spot_quote_volume_24h_usd is not None
+            and instrument.spot_quote_volume_24h_usd < uni.min_24h_quote_volume_usd
         ):
             return (
-                f"24h volume ${instrument.quote_volume_24h_usd:,.0f} "
+                f"spot 24h volume ${instrument.spot_quote_volume_24h_usd:,.0f} "
+                f"< min_24h_quote_volume_usd=${uni.min_24h_quote_volume_usd:,.0f}"
+            )
+        if (
+            instrument.perp_quote_volume_24h_usd is not None
+            and instrument.perp_quote_volume_24h_usd < uni.min_24h_quote_volume_usd
+        ):
+            return (
+                f"perp 24h volume ${instrument.perp_quote_volume_24h_usd:,.0f} "
                 f"< min_24h_quote_volume_usd=${uni.min_24h_quote_volume_usd:,.0f}"
             )
         if instrument.listed_at is not None:

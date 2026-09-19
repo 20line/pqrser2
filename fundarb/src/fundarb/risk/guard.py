@@ -58,6 +58,10 @@ class RiskGuard:
     def kill_switch_active(self) -> bool:
         return self._kill_switch_active
 
+    @property
+    def kill_switch_reason(self) -> str:
+        return self._kill_switch_reason
+
     def trigger_kill_switch(self, reason: str) -> None:
         self._kill_switch_active = True
         self._kill_switch_reason = reason

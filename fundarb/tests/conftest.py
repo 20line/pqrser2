@@ -8,8 +8,11 @@ from fundarb.config import (
     EntryConfig,
     ExitRuleConfig,
     FeesConfig,
+    FundarbConfig,
+    MonitorConfig,
     RebalanceConfig,
     RiskConfig,
+    UniverseConfig,
     VenueFees,
 )
 
@@ -67,3 +70,22 @@ def entry_config() -> EntryConfig:
 @pytest.fixture
 def exit_rule_config() -> ExitRuleConfig:
     return ExitRuleConfig()
+
+
+@pytest.fixture
+def fundarb_config(
+    entry_config: EntryConfig,
+    exit_rule_config: ExitRuleConfig,
+    risk_config: RiskConfig,
+    rebalance_config: RebalanceConfig,
+    fees_config: FeesConfig,
+) -> FundarbConfig:
+    return FundarbConfig(
+        universe=UniverseConfig(),
+        entry=entry_config,
+        exit_rule=exit_rule_config,
+        rebalance=rebalance_config,
+        risk=risk_config,
+        fees=fees_config,
+        monitor=MonitorConfig(),
+    )

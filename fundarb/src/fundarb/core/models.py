@@ -59,7 +59,8 @@ class Instrument(_Model):
     qty_step: Decimal
     min_qty: Decimal
     listed_at: datetime | None = None
-    quote_volume_24h_usd: Decimal | None = None
+    spot_quote_volume_24h_usd: Decimal | None = None
+    perp_quote_volume_24h_usd: Decimal | None = None
 
 
 class Quote(_Model):
