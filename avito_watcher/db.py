@@ -82,8 +82,16 @@ CREATE TABLE IF NOT EXISTS process_state (
 """
 
 
+def _fmt(dt: datetime) -> str:
+    # Пробел вместо 'T' — тот же формат, что выдаёт SQLite datetime()/date(),
+    # иначе строковое сравнение вида `ts >= datetime('now', '-1 day')`
+    # сравнивает 'T' (0x54) с ' ' (0x20) раньше, чем реальное время суток,
+    # и даёт неверный результат независимо от фактического часа.
+    return dt.isoformat(sep=" ", timespec="seconds")
+
+
 def _now() -> str:
-    return datetime.utcnow().isoformat()
+    return _fmt(datetime.utcnow())
 
 
 def _parse_dt(value: Optional[str]) -> Optional[datetime]:
@@ -152,12 +160,13 @@ class Database:
 
     # ---------- bootstrap ----------
 
-    async def ensure_global_settings(self, owner_chat_id: int) -> None:
+    async def ensure_global_settings(self, owner_chat_id: int, timezone: str = "Europe/Moscow") -> None:
         cur = await self.conn.execute("SELECT id FROM global_settings WHERE id = 1")
         row = await cur.fetchone()
         if row is None:
             await self.conn.execute(
-                "INSERT INTO global_settings (id, owner_chat_id) VALUES (1, ?)", (owner_chat_id,)
+                "INSERT INTO global_settings (id, owner_chat_id, timezone) VALUES (1, ?, ?)",
+                (owner_chat_id, timezone),
             )
         await self.conn.execute(
             "INSERT OR IGNORE INTO captcha_state (id, active, strikes) VALUES (1, 0, 0)"
@@ -255,7 +264,7 @@ class Database:
     async def touch_profile_checked(self, profile_id: int, when: Optional[datetime] = None) -> None:
         await self.conn.execute(
             "UPDATE profiles SET last_checked_at = ? WHERE id = ?",
-            ((when or datetime.utcnow()).isoformat(), profile_id),
+            (_fmt(when or datetime.utcnow()), profile_id),
         )
         await self.conn.commit()
 
@@ -287,7 +296,7 @@ class Database:
                VALUES (?, ?, ?, ?)
                ON CONFLICT(profile_id, listing_id)
                DO UPDATE SET last_price = excluded.last_price""",
-            (profile_id, listing_id, price, (first_seen_at or datetime.utcnow()).isoformat()),
+            (profile_id, listing_id, price, _fmt(first_seen_at or datetime.utcnow())),
         )
         await self.conn.commit()
 
@@ -340,17 +349,16 @@ class Database:
         strikes: Optional[int] = None,
         last_captcha_at: Optional[datetime] = None,
     ) -> None:
-        fields = ["active = ?"]
-        params: list = [int(active)]
-        if resume_at is not None or resume_at is None:
-            fields.append("resume_at = ?")
-            params.append(resume_at.isoformat() if resume_at else None)
+        # resume_at выставляется безусловно (включая явный сброс в None при
+        # возобновлении) — вызывающий код всегда передаёт его осознанно.
+        fields = ["active = ?", "resume_at = ?"]
+        params: list = [int(active), _fmt(resume_at) if resume_at else None]
         if strikes is not None:
             fields.append("strikes = ?")
             params.append(strikes)
         if last_captcha_at is not None:
             fields.append("last_captcha_at = ?")
-            params.append(last_captcha_at.isoformat())
+            params.append(_fmt(last_captcha_at))
         await self.conn.execute(f"UPDATE captcha_state SET {', '.join(fields)} WHERE id = 1", params)
         await self.conn.commit()
 

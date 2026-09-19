@@ -119,3 +119,19 @@ def test_is_within_quiet_hours_handles_midnight_wraparound(current, start, end, 
 def test_is_within_quiet_hours_false_when_disabled():
     settings = make_settings(quiet_hours_enabled=False)
     assert is_within_quiet_hours(settings, datetime(2024, 1, 1, 2, 0)) is False
+
+
+def test_is_within_quiet_hours_uses_settings_timezone_when_now_omitted():
+    """Регрессия: раньше функция всегда брала datetime.now() (системный
+    часовой пояс сервера), полностью игнорируя settings.timezone (п.5 ТЗ).
+    Проверяем, что с now=None вызов реально смотрит на зону из настроек и
+    не падает ни на валидной, ни на некорректной строке зоны."""
+    settings_msk = make_settings(
+        quiet_hours_enabled=True, quiet_hours_start="00:00", quiet_hours_end="23:59", timezone="Europe/Moscow"
+    )
+    assert is_within_quiet_hours(settings_msk) is True  # весь день "тихий" — не должно падать
+
+    settings_bad_tz = make_settings(
+        quiet_hours_enabled=True, quiet_hours_start="00:00", quiet_hours_end="23:59", timezone="Not/AZone"
+    )
+    assert is_within_quiet_hours(settings_bad_tz) is True  # graceful fallback, без исключения

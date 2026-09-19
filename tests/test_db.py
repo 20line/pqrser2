@@ -112,6 +112,29 @@ async def test_events_log_count_last_24h(db: Database):
     assert await db.count_events_last_24h(("error", "captcha")) == 2
 
 
+async def test_events_log_excludes_events_older_than_24h(db: Database):
+    """Регрессия: сравнение хранимой метки времени с datetime('now', '-1 day')
+    в SQL раньше давало неверный результат из-за разных разделителей даты/
+    времени ('T' у Python isoformat() против пробела у SQLite datetime()) —
+    события ровно на границе суток внутри «сегодня», но раньше порога 24ч,
+    ошибочно засчитывались. Проверяем обе стороны границы напрямую."""
+    from datetime import datetime, timedelta
+
+    old_ts = (datetime.utcnow() - timedelta(hours=30)).isoformat(sep=" ", timespec="seconds")
+    recent_ts = (datetime.utcnow() - timedelta(hours=1)).isoformat(sep=" ", timespec="seconds")
+    await db.conn.execute(
+        "INSERT INTO events_log (event_type, profile_id, detail, ts) VALUES (?, NULL, 'old', ?)",
+        ("error", old_ts),
+    )
+    await db.conn.execute(
+        "INSERT INTO events_log (event_type, profile_id, detail, ts) VALUES (?, NULL, 'recent', ?)",
+        ("error", recent_ts),
+    )
+    await db.conn.commit()
+
+    assert await db.count_events_last_24h(("error",)) == 1
+
+
 async def test_layout_broken_flag(db: Database):
     assert await db.get_layout_broken() is False
     await db.set_layout_broken(True)

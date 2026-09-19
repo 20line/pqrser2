@@ -22,6 +22,7 @@ class AppConfig:
     db_path: Path
     log_dir: Path
     browser_profile_dir: Path
+    timezone: str = "Europe/Moscow"
     log_max_bytes: int = 5_000_000
     log_backup_count: int = 5
 
@@ -50,6 +51,7 @@ def load_config(env_path: Path | None = None) -> AppConfig:
     browser_profile_dir = Path(
         os.environ.get("BROWSER_PROFILE_DIR", str(BASE_DIR / "data" / "browser_profile"))
     )
+    timezone = os.environ.get("TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -61,4 +63,5 @@ def load_config(env_path: Path | None = None) -> AppConfig:
         db_path=db_path,
         log_dir=log_dir,
         browser_profile_dir=browser_profile_dir,
+        timezone=timezone,
     )

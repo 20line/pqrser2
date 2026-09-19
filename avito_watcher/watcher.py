@@ -158,14 +158,21 @@ class WatcherEngine:
                 await self.db.upsert_seen_listing(profile.id, card.listing_id, card.price)
                 if not is_first_run:
                     events.append(notifications.build_new_listing_event(profile, card))
-            elif prior.last_price is not None and card.price is not None and card.price < prior.last_price:
-                old_price = prior.last_price
-                await self.db.upsert_seen_listing(
-                    profile.id, card.listing_id, card.price, prior.first_seen_at
+            else:
+                price_dropped = (
+                    prior.last_price is not None
+                    and card.price is not None
+                    and card.price < prior.last_price
                 )
-                if not is_first_run:
-                    events.append(notifications.build_price_drop_event(profile, card, old_price))
-            # цена не изменилась / выросла — игнорируем (п.6.6 ТЗ)
+                # обновляем сохранённую цену при любом изменении (и росте, и
+                # падении) — иначе после роста цены дальнейшее её снижение
+                # сравнивалось бы со старой заниженной отметкой и терялось
+                if card.price != prior.last_price:
+                    await self.db.upsert_seen_listing(
+                        profile.id, card.listing_id, card.price, prior.first_seen_at
+                    )
+                if price_dropped and not is_first_run:
+                    events.append(notifications.build_price_drop_event(profile, card, prior.last_price))
 
         await self.db.touch_profile_checked(profile.id)
         self._consecutive_errors = 0

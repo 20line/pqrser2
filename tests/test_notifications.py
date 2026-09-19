@@ -66,6 +66,26 @@ def test_format_event_price_drop_contains_old_and_new_price():
     assert "30 000" in text
 
 
+def test_format_event_escapes_html_special_chars_in_url_and_title():
+    """Регрессия: Telegram-бот шлёт сообщения с parse_mode=HTML, а
+    поисковые ссылки Avito почти всегда содержат '&' между параметрами
+    фильтров — без экранирования такое сообщение целиком отклонялось бы
+    Telegram API ("can't parse entities")."""
+    profile = make_profile(name="Тест <script> & Co")
+    card = ListingCard(
+        listing_id="1",
+        title="iPhone <13> & чехол",
+        price=1000,
+        url="https://www.avito.ru/search?a=1&b=2",
+    )
+    ev = build_new_listing_event(profile, card)
+    text = format_event(ev)
+    assert "<script>" not in text
+    assert "&b=2" not in text  # сырой '&' не должен просочиться как есть
+    assert "&amp;" in text
+    assert "&lt;script&gt;" in text
+
+
 @pytest.fixture
 async def db(tmp_path: Path):
     database = Database(tmp_path / "test.db")
@@ -117,6 +137,53 @@ async def test_notifier_queues_in_digest_mode_until_flush(db: Database):
     combined_text = recorder.sent[0][1]
     assert "iPhone A" in combined_text and "iPhone B" in combined_text
     assert notifier.pending_digest_count() == 0
+
+
+async def test_digest_flush_splits_into_chunks_under_telegram_limit(db: Database):
+    settings = GlobalSettings(owner_chat_id=42, digest_mode=True, digest_interval_minutes=15)
+    recorder = Recorder()
+    notifier = Notifier(recorder, db, lambda: settings)
+
+    pid = await db.add_profile("A", "https://www.avito.ru/1", None, [])
+    profile = make_profile(id=pid)
+    # У каждого события длинный заголовок, чтобы гарантированно перевалить
+    # за лимит Telegram (4096 символов) суммарно и потребовать несколько частей.
+    for i in range(40):
+        card = ListingCard(
+            listing_id=str(i),
+            title="X" * 150,
+            price=1000 + i,
+            url=f"https://x/{i}",
+        )
+        await notifier.enqueue(build_new_listing_event(profile, card))
+
+    await notifier.flush_digest_if_due()
+
+    assert len(recorder.sent) > 1  # не влезло в одно сообщение
+    for _, text in recorder.sent:
+        assert len(text) <= 4096
+    assert notifier.pending_digest_count() == 0
+
+
+async def test_digest_flush_requeues_undelivered_chunks_on_send_failure(db: Database):
+    settings = GlobalSettings(owner_chat_id=42, digest_mode=True, digest_interval_minutes=15)
+
+    calls = []
+
+    async def failing_send(chat_id, text, **kwargs):
+        calls.append(text)
+        raise RuntimeError("сеть недоступна")
+
+    notifier = Notifier(failing_send, db, lambda: settings)
+    pid = await db.add_profile("A", "https://www.avito.ru/1", None, [])
+    profile = make_profile(id=pid)
+    card = ListingCard(listing_id="1", title="iPhone", price=1000, url="https://x")
+    await notifier.enqueue(build_new_listing_event(profile, card))
+
+    await notifier.flush_digest_if_due()
+
+    assert len(calls) == 1  # попытка отправки была
+    assert notifier.pending_digest_count() == 1  # но недоставленное вернулось в очередь
 
 
 async def test_notify_profile_added_summary_text(db: Database):

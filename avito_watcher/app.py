@@ -32,7 +32,7 @@ async def run(config: Optional[AppConfig] = None) -> None:
 
     db = Database(config.db_path)
     await db.connect()
-    await db.ensure_global_settings(config.owner_chat_id)
+    await db.ensure_global_settings(config.owner_chat_id, timezone=config.timezone)
 
     settings_cache = SettingsCache(db)
     await settings_cache.load()

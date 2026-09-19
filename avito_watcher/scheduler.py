@@ -15,6 +15,7 @@ import random
 import time
 from datetime import datetime, time as dtime
 from typing import Awaitable, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from avito_watcher.db import Database
 from avito_watcher.models import GlobalSettings
@@ -31,7 +32,15 @@ def _parse_hhmm(value: str) -> dtime:
 def is_within_quiet_hours(settings: GlobalSettings, now: datetime | None = None) -> bool:
     if not settings.quiet_hours_enabled:
         return False
-    now = now or datetime.now()
+    if now is None:
+        # «Тихие часы» заданы в часовом поясе владельца (settings.timezone,
+        # п.5 ТЗ), а не в системном времени сервера — иначе диапазон
+        # съезжает, если бот запущен не в том же поясе, что и владелец.
+        try:
+            tz = ZoneInfo(settings.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            tz = None
+        now = datetime.now(tz)
     current = now.time()
     start = _parse_hhmm(settings.quiet_hours_start)
     end = _parse_hhmm(settings.quiet_hours_end)

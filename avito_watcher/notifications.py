@@ -8,10 +8,15 @@ from typing import Callable, Optional, Protocol
 
 from avito_watcher.db import Database
 from avito_watcher.models import GlobalSettings, ListingCard, NotificationEvent, Profile
+from avito_watcher.textutils import escape_html
 
 
 class SendMessageFn(Protocol):
     async def __call__(self, chat_id: int, text: str, **kwargs) -> None: ...
+
+
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+DIGEST_SEPARATOR = "\n\n---\n\n"
 
 
 def format_price(price: Optional[int]) -> str:
@@ -48,22 +53,25 @@ def build_price_drop_event(profile: Profile, card: ListingCard, old_price: Optio
 
 
 def format_event(ev: NotificationEvent) -> str:
+    profile_name = escape_html(ev.profile_name)
+    title = escape_html(ev.title)
+    url = escape_html(ev.url)
     if ev.kind == "new":
-        lines = [f"🆕 {ev.profile_name}", ev.title]
+        lines = [f"🆕 {profile_name}", title]
         price_line = f"💰 {format_price(ev.price)}"
         if ev.good_price:
             price_line += " 🔥 хорошая цена"
         lines.append(price_line)
         if ev.location:
-            lines.append(f"📍 {ev.location}")
-        lines.append(ev.url)
+            lines.append(f"📍 {escape_html(ev.location)}")
+        lines.append(url)
         return "\n".join(lines)
     elif ev.kind == "price_drop":
         lines = [
-            f"📉 {ev.profile_name}",
-            ev.title,
+            f"📉 {profile_name}",
+            title,
             f"Было: {format_price(ev.old_price)} → Стало: {format_price(ev.price)}",
-            ev.url,
+            url,
         ]
         return "\n".join(lines)
     raise ValueError(f"Неизвестный тип уведомления: {ev.kind}")
@@ -104,32 +112,58 @@ class Notifier:
         else:
             await self._send_text(format_event(ev))
 
-    async def _send_text(self, text: str) -> None:
+    async def _send_text(self, text: str) -> bool:
         owner_chat_id = await self._owner_chat_id()
         try:
             await self._send_message(chat_id=owner_chat_id, text=text)
+            return True
         except Exception:
             self.logger.exception("Не удалось отправить сообщение владельцу")
+            return False
 
     async def send_alert(self, text: str) -> None:
         await self._send_text(text)
 
     async def notify_profile_added_summary(self, profile: Profile, listings_count: int) -> None:
         text = (
-            f'Добавлен товар "{profile.name}", в выдаче сейчас {listings_count} '
+            f'Добавлен товар "{escape_html(profile.name)}", в выдаче сейчас {listings_count} '
             f"объявлени{_plural_ya(listings_count)}, буду присылать только новые."
         )
         await self._send_text(text)
 
     async def flush_digest_if_due(self) -> None:
-        """Вызывается периодически внешним таймером; сам решает, отправлять ли."""
+        """Вызывается периодически внешним таймером; сам решает, отправлять ли.
+
+        Разбивает накопленные уведомления на части под лимит длины
+        сообщения Telegram (4096 символов) и не теряет недоставленное:
+        при сбое отправки недошедший остаток возвращается в очередь для
+        следующей попытки, а не молча отбрасывается.
+        """
         async with self._lock:
             if not self._digest_queue:
                 return
             batch = self._digest_queue
             self._digest_queue = []
-        text = "\n\n---\n\n".join(format_event(ev) for ev in batch)
-        await self._send_text(text)
+
+        chunks: list[list[NotificationEvent]] = [[]]
+        chunk_len = 0
+        for ev in batch:
+            piece_len = len(format_event(ev)) + len(DIGEST_SEPARATOR)
+            if chunks[-1] and chunk_len + piece_len > TELEGRAM_MAX_MESSAGE_LENGTH:
+                chunks.append([])
+                chunk_len = 0
+            chunks[-1].append(ev)
+            chunk_len += piece_len
+
+        for i, chunk in enumerate(chunks):
+            if not chunk:
+                continue
+            text = DIGEST_SEPARATOR.join(format_event(ev) for ev in chunk)
+            if not await self._send_text(text):
+                leftover = [ev for remaining_chunk in chunks[i:] for ev in remaining_chunk]
+                async with self._lock:
+                    self._digest_queue = leftover + self._digest_queue
+                break
 
     async def digest_flush_loop(self) -> None:
         """Фоновая задача: раз в digest_interval_minutes отправляет накопленное."""

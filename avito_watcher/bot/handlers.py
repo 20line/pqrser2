@@ -4,7 +4,7 @@ owner_chat_id через OwnerOnlyMiddleware, регистрируемую в ap
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from aiogram import F, Router
@@ -17,6 +17,7 @@ from avito_watcher.bot.states import AddProfileStates, EditProfileStates, Settin
 from avito_watcher.db import Database
 from avito_watcher.scheduler import Scheduler
 from avito_watcher.settings_cache import SettingsCache
+from avito_watcher.textutils import escape_html
 from avito_watcher.watcher import WatcherEngine
 
 router = Router(name="avito_watcher")
@@ -198,7 +199,7 @@ async def cb_profile_delete_confirm_ask(cb: CallbackQuery, db: Database) -> None
         await cb.answer("Товар не найден", show_alert=True)
         return
     await cb.message.edit_text(
-        f'Удалить товар «{profile.name}»? Это действие нельзя отменить.',
+        f'Удалить товар «{escape_html(profile.name)}»? Это действие нельзя отменить.',
         reply_markup=keyboards.confirm_delete(profile_id),
     )
     await cb.answer()
@@ -213,7 +214,7 @@ async def cb_profile_delete_do(cb: CallbackQuery, db: Database) -> None:
     await db.log_event("owner_action", None, f"profile_deleted:{name}")
     profiles = await db.list_profiles()
     await cb.message.edit_text(
-        f'Товар «{name}» удалён.\n\n📦 Ваши товары:', reply_markup=keyboards.products_list(profiles)
+        f'Товар «{escape_html(name)}» удалён.\n\n📦 Ваши товары:', reply_markup=keyboards.products_list(profiles)
     )
     await cb.answer("Удалено")
 
@@ -246,7 +247,7 @@ async def cb_profile_edit_menu(cb: CallbackQuery, state: FSMContext, db: Databas
         await cb.answer("Товар не найден", show_alert=True)
         return
     await cb.message.edit_text(
-        f'Что изменить в товаре «{profile.name}»?', reply_markup=keyboards.edit_profile_menu(profile_id)
+        f'Что изменить в товаре «{escape_html(profile.name)}»?', reply_markup=keyboards.edit_profile_menu(profile_id)
     )
     await cb.answer()
 
@@ -443,7 +444,7 @@ async def cb_add_confirm(cb: CallbackQuery, state: FSMContext, db: Database, sch
     await state.clear()
     scheduler.request_check_now(profile_id)
     await cb.message.edit_text(
-        f'Товар «{data["name"]}» сохранён. Скоро проведу первую проверку и пришлю сводку.'
+        f'Товар «{escape_html(data["name"])}» сохранён. Скоро проведу первую проверку и пришлю сводку.'
     )
     await cb.answer("Сохранено")
 
@@ -574,8 +575,11 @@ async def cb_stats(cb: CallbackQuery, state: FSMContext, db: Database, scheduler
         found_today = await db.count_notifications_today(p.id)
         if p.last_checked_at:
             interval = scheduler.effective_interval_estimate_seconds(len(profiles))
-            next_check = (p.last_checked_at.timestamp() + interval)
-            next_check_str = datetime.fromtimestamp(next_check).strftime("%H:%M")
+            # last_checked_at хранится как наивный UTC — явно помечаем tz,
+            # прежде чем переводить в локальное время для отображения
+            last_checked_utc = p.last_checked_at.replace(tzinfo=timezone.utc)
+            next_check_utc = last_checked_utc + timedelta(seconds=interval)
+            next_check_str = next_check_utc.astimezone().strftime("%H:%M")
         else:
             next_check_str = "скоро"
         rows.append(
