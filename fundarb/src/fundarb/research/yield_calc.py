@@ -33,6 +33,19 @@ def basis_fraction(spot_price: Decimal, perp_price: Decimal) -> Decimal:
     return (perp_price - spot_price) / spot_price
 
 
+def basis_pnl(entry_basis: Decimal, exit_basis: Decimal, notional: Decimal) -> Decimal:
+    """Dollar PnL from basis drift between entry and exit (or entry and the
+    current mark, for an unrealized check). Negative sign because the
+    position is long spot / short perp: a basis that WIDENS after entry
+    (perp rises relative to spot) costs the short perp leg money.
+
+    The single shared implementation of the ΔB term — backtest/strategy.py,
+    backtest/engine.py, and execution/live_runner.py all need it and must
+    stay in sync with each other and with net_apr()'s ΔB below.
+    """
+    return -(exit_basis - entry_basis) * notional
+
+
 def annualized_raw_rate(rates: list[FundingRate]) -> Decimal:
     """Mean of each record's own annualized rate — robust to interval
     changes within the history.

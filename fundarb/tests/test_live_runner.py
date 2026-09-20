@@ -8,7 +8,7 @@ import pytest
 from fundarb.backtest.strategy import CarryStrategy
 from fundarb.collect.storage import ParquetStorage
 from fundarb.config import ExitRuleConfig, FundarbConfig, RateReversalExit
-from fundarb.core.errors import ExchangeAdapterError
+from fundarb.core.errors import ExchangeAdapterError, StorageError
 from fundarb.core.models import Balances, FundingRate, Position, Quote
 from fundarb.core.types import ExitRuleMode, IntentReason, Market, OrderSide, Venue
 from fundarb.execution.executor import TwoLegExecutor
@@ -201,6 +201,7 @@ async def test_fixed_profit_exit_closes_position(tmp_path, fundarb_config) -> No
     assert len(adapter.placed_intents) == 4
     assert adapter.placed_intents[-1].reason is IntentReason.EXIT_LEG1
     assert adapter.placed_intents[-1].market is Market.SPOT
+    assert (_VENUE, _SYMBOL) not in runner.metrics.positions  # stale snapshot must not linger
 
     ledger_rows = runner.ledger.read_all()
     assert ledger_rows.height == 1
@@ -353,6 +354,9 @@ async def test_stop_loss_forces_close_on_unrealized_loss(tmp_path, fundarb_confi
     # the ~$601 realized loss also breaches daily_loss_limit_usd=500 ->
     # record_realized_pnl chains into the kill switch, blocking new entries
     assert runner.risk.kill_switch_active
+    # ...and the operator gets an explicit kill-switch push, not just the
+    # stop-loss message above
+    assert any(call[0] == "kill_switch" for call in alerter.calls)
 
 
 @pytest.mark.asyncio
@@ -526,3 +530,78 @@ async def test_position_metadata_survives_restart(tmp_path, fundarb_config) -> N
     assert runner2.position.entry_basis == original_entry_basis
     assert runner2.position.spot_qty == Decimal("0.1")
     assert runner2.position.perp_qty == Decimal("0.1")
+
+
+class _FailingLedger:
+    """Stands in for TradeLedger — always raises on append, to verify a
+    ledger write failure doesn't leave position state stale or crash the
+    cycle (see live_runner.py::_execute_close).
+    """
+
+    def append(self, entry) -> None:
+        raise StorageError("disk full")
+
+    def read_all(self):
+        raise NotImplementedError
+
+
+@pytest.mark.asyncio
+async def test_ledger_write_failure_does_not_leave_position_stale_or_crash(tmp_path, fundarb_config) -> None:
+    adapter = FakeAdapter(
+        fill_responses=[
+            filled_ack(_VENUE, "entry-leg1", "0.1"),
+            filled_ack(_VENUE, "entry-leg2", "0.1"),
+            filled_ack(_VENUE, "exit-leg1", "0.1"),
+            filled_ack(_VENUE, "exit-leg2", "0.1"),
+        ],
+        quotes=_quotes(),
+        funding_history=[],
+    )
+    runner, storage, alerter = _build_runner(tmp_path, fundarb_config, adapter)
+    runner.ledger = _FailingLedger()
+    storage.write_funding_rates(_high_yield_rates())
+
+    await runner.start()
+    await runner.run_once()
+    assert runner.position is not None
+    entry_time = runner.position.entry_time
+
+    storage.write_funding_rates(
+        [
+            FundingRate(
+                venue=_VENUE,
+                symbol=_SYMBOL,
+                funding_time=entry_time + timedelta(seconds=i + 1),
+                rate=Decimal("0.0035"),
+                interval_hours=8,
+                mark_price=_SPOT_PRICE,
+            )
+            for i in range(2)
+        ]
+    )
+
+    await runner.run_once()  # must not raise despite the ledger failure
+
+    # the exchange legs closed successfully -> position state must reflect
+    # that even though the ledger write failed
+    assert runner.position is None
+    assert runner.journal.load(_VENUE, _SYMBOL) is None
+    assert any(call[0] == "send" and "ledger write failed" in call[1][0] for call in alerter.calls)
+
+
+@pytest.mark.asyncio
+async def test_unhandled_exception_in_cycle_is_caught_and_alerted(tmp_path, fundarb_config, monkeypatch) -> None:
+    adapter = FakeAdapter(quotes=_quotes(), funding_history=[])
+    runner, storage, alerter = _build_runner(tmp_path, fundarb_config, adapter)
+    storage.write_funding_rates(_high_yield_rates())
+    await runner.start()
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("unexpected bug")
+
+    monkeypatch.setattr(runner, "_try_enter", _boom)
+
+    await runner.run_once()  # must not raise
+
+    assert runner.position is None
+    assert any(call[0] == "send" and "unhandled error" in call[1][0] for call in alerter.calls)

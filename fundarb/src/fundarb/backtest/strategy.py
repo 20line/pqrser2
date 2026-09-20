@@ -15,6 +15,7 @@ from decimal import Decimal
 
 from fundarb.config import EntryConfig, ExitRuleConfig
 from fundarb.core.types import ExitRuleMode, Venue
+from fundarb.research.yield_calc import basis_pnl
 
 
 @dataclass
@@ -131,8 +132,9 @@ class CarryStrategy(Strategy):
         return self._decide_exit_rate_reversal(position)
 
     def _decide_exit_fixed_profit(self, position: OpenPosition, current_basis: Decimal) -> ExitDecision:
-        basis_pnl = -(current_basis - position.entry_basis) * position.notional
-        total_pnl = position.cumulative_funding_pnl + basis_pnl
+        total_pnl = position.cumulative_funding_pnl + basis_pnl(
+            position.entry_basis, current_basis, position.notional
+        )
         target = self.exit_cfg.fixed_profit.target_pct_of_notional / 100 * position.notional
         if total_pnl >= target:
             return ExitDecision(

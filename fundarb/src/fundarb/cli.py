@@ -201,6 +201,9 @@ async def _run(
     try:
         await runner.start()
         while True:
+            # run_once() is documented not to raise — it's its own backstop
+            # against unexpected exceptions, so this loop stays deliberately
+            # bare rather than duplicating that handling here.
             await runner.run_once()
             await asyncio.sleep(poll_interval)
     finally:

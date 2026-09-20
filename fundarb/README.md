@@ -153,6 +153,36 @@ A second pass closed four more gaps, all in `LiveRunner`:
   rejects entries whose basis is too wide, directly implementing the
   spec's risk-table row for basis-convergence risk.
 
+A third pass (a `code-review`-skill audit of the diff above) found four
+smaller but real issues in `_execute_close`, now fixed:
+
+- **A trade-ledger write failure used to leave `self.position` stale and
+  crash the whole process** — the exchange legs had already closed, but
+  the exception from `ledger.append()` propagated before `journal.clear()`
+  / `self.position = None` ran, and `cli.py`'s loop had no try/except at
+  all. Fixed by reordering `_execute_close` so the safety-critical state
+  (risk's realized-PnL tracker, the journal, `self.position`, metrics)
+  updates immediately after the exchange confirms the close, with the
+  ledger write isolated in its own try/except afterward — a parquet
+  failure now logs and alerts instead of corrupting position tracking.
+- **`MetricsRegistry.positions` was never cleared on close**, so a closed
+  position's last snapshot (margin ratio, basis, accumulated funding) sat
+  there indefinitely, reporting a flat symbol as still open and at risk.
+- **A kill switch triggered by the `daily_loss_limit_usd` cascade (via
+  `record_realized_pnl`) never actually alerted** — the operator got the
+  triggering event's own message (e.g. "stop-loss triggered") but nothing
+  telling them new entries are now blocked pending a manual reset.
+- **The `-(exit_basis - entry_basis) * notional` basis-PnL formula was
+  hand-rolled identically in three places** (`backtest/strategy.py`,
+  `backtest/engine.py`, `execution/live_runner.py`) — extracted to
+  `research/yield_calc.py::basis_pnl`, the single place a future change to
+  the PnL convention now needs to happen.
+
+The same pass added a last-resort backstop: `LiveRunner.run_once()` now
+catches and alerts on any exception a cycle didn't already handle inline,
+rather than relying solely on `cli.py`'s loop (deliberately bare) or
+process supervision to recover.
+
 ## Setup
 
 ```bash
@@ -194,10 +224,12 @@ rollback on leg-2 failure, rollback-failure escalating to the kill switch),
 idempotent parquet storage, the scanner's liquidity filter (both legs, not
 just spot), and the live runner end to end against a fake adapter — entry
 (including the basis filter and leverage check), both exit rules, the
-position-level stop-loss (and its cascade into the daily-loss kill switch),
-auto rebalance, kill-switch auto-close, margin/rate-reversal alerting, the
-trade ledger, and position persistence across a simulated restart. CI runs
-the suite on every push/PR touching `fundarb/**`
+position-level stop-loss (and its cascade into the daily-loss kill switch,
+including the kill-switch alert itself), auto rebalance, kill-switch
+auto-close, margin/rate-reversal alerting, the trade ledger (including
+isolation from a failing ledger write), metrics cleanup on close, the
+unhandled-exception backstop, and position persistence across a simulated
+restart. CI runs the suite on every push/PR touching `fundarb/**`
 (`.github/workflows/fundarb-tests.yml`).
 
 ## Known limitations (carried over from the spec)

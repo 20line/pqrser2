@@ -59,6 +59,14 @@ class MetricsRegistry:
             margin_ratio=margin_ratio,
         )
 
+    def clear_position(self, venue: Venue, symbol: str) -> None:
+        """Called on every close — without this the last pre-close snapshot
+        (margin ratio, basis, accumulated funding) sits in `positions`
+        forever, so anything reading it reports a flat symbol as still
+        open and at risk.
+        """
+        self.positions.pop((venue, symbol), None)
+
     def heartbeat(self, venue: Venue) -> None:
         self.connections[venue] = ConnectionMetrics(venue=venue, connected=True)
 

@@ -44,7 +44,7 @@ from fundarb.backtest.strategy import CarryStrategy, OpenPosition
 from fundarb.collect.history import HistoryCollector
 from fundarb.collect.storage import ParquetStorage
 from fundarb.config import FundarbConfig
-from fundarb.core.errors import ExchangeAdapterError
+from fundarb.core.errors import ExchangeAdapterError, StorageError
 from fundarb.core.types import IntentReason, Market, OrderSide, RebalanceMode, Venue
 from fundarb.exchanges.base import ExchangeAdapter
 from fundarb.exchanges.symbols import split
@@ -55,7 +55,7 @@ from fundarb.execution.reconcile import reconcile
 from fundarb.monitor.alerts import TelegramAlerter
 from fundarb.monitor.metrics import MetricsRegistry
 from fundarb.research.fees import round_trip_cost_fraction
-from fundarb.research.yield_calc import annualized_raw_rate, basis_fraction
+from fundarb.research.yield_calc import annualized_raw_rate, basis_fraction, basis_pnl
 from fundarb.risk.guard import RiskGuard
 
 log = structlog.get_logger(__name__)
@@ -144,6 +144,28 @@ class LiveRunner:
     # ---- one decision cycle ---------------------------------------------
 
     async def run_once(self) -> None:
+        """Public entrypoint: never raises. `_run_cycle` already handles the
+        exchange-connectivity failure modes it knows about inline (quote
+        fetch, live collection); this catches everything else — a bug, an
+        unexpected exchange response shape, a transient storage error — so
+        one bad cycle logs and alerts instead of taking the whole process
+        down. `cli.py` relies on this: its loop has no try/except of its
+        own, deliberately, so this is the only backstop.
+        """
+        try:
+            await self._run_cycle()
+        except Exception as exc:  # noqa: BLE001 - last-resort backstop, see docstring
+            log.critical(
+                "unhandled exception in decision cycle, will retry next cycle",
+                symbol=self.symbol,
+                error=str(exc),
+                exc_info=True,
+            )
+            await self.alerter.send(
+                f"🚨 {self.symbol}: unhandled error in trading cycle ({exc}) — will retry next cycle"
+            )
+
+    async def _run_cycle(self) -> None:
         epoch_key = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M")
 
         if self.risk.kill_switch_active:
@@ -331,8 +353,8 @@ class LiveRunner:
         """
         assert self.position is not None
         funding_pnl = self.position.cumulative_funding_pnl
-        basis_pnl = -(basis - self.position.entry_basis) * self.position.notional
-        return funding_pnl, basis_pnl, funding_pnl + basis_pnl
+        drag = basis_pnl(self.position.entry_basis, basis, self.position.notional)
+        return funding_pnl, drag, funding_pnl + drag
 
     def _unrealized_pnl(self, basis: Decimal) -> Decimal:
         return self._pnl_breakdown(basis)[2]
@@ -344,6 +366,14 @@ class LiveRunner:
         switch) so realized PnL is recorded consistently — funding AND
         basis drag, not funding alone — and every close lands in the trade
         ledger, not just structlog output.
+
+        Order matters here: the safety-critical state (risk's realized-PnL
+        tracker, the journal, `self.position`, metrics) is updated first,
+        right after the exchange confirms both legs closed. The ledger
+        write happens last and is isolated in its own try/except — it's a
+        reporting concern, and a parquet write failure (disk full, a
+        concurrent writer) must never leave `self.position` pointing at a
+        position that no longer exists on the exchange, or crash the cycle.
         """
         assert self.position is not None
         position = self.position
@@ -366,27 +396,43 @@ class LiveRunner:
             log.error("position close failed", symbol=self.symbol, reason=reason.value, error=result.reason)
             return False
 
-        funding_pnl, basis_pnl, realized_pnl = self._pnl_breakdown(basis)
-        self.risk.record_realized_pnl(realized_pnl)
+        funding_pnl, drag, realized_pnl = self._pnl_breakdown(basis)
+        kill_switch_triggered = self.risk.record_realized_pnl(realized_pnl)
         exit_time = datetime.now(timezone.utc)
-        self.ledger.append(
-            LedgerEntry(
-                venue=self.venue,
-                symbol=self.symbol,
-                entry_time=position.entry_time,
-                exit_time=exit_time,
-                entry_basis=position.entry_basis,
-                exit_basis=basis,
-                notional=position.notional,
-                funding_pnl=funding_pnl,
-                basis_pnl=basis_pnl,
-                realized_pnl=realized_pnl,
-                exit_reason=reason.value,
-            )
-        )
-        log.info("position closed", symbol=self.symbol, reason=reason.value, realized_pnl=str(realized_pnl))
+
         self.journal.clear(self.venue, self.symbol)
+        self.metrics.clear_position(self.venue, self.symbol)
         self.position = None
+        log.info("position closed", symbol=self.symbol, reason=reason.value, realized_pnl=str(realized_pnl))
+
+        if kill_switch_triggered:
+            # record_realized_pnl only logs; the operator needs an explicit
+            # push that new entries are now blocked pending manual reset,
+            # not just the close message above.
+            await self.alerter.kill_switch(self.risk.kill_switch_reason)
+
+        try:
+            self.ledger.append(
+                LedgerEntry(
+                    venue=self.venue,
+                    symbol=self.symbol,
+                    entry_time=position.entry_time,
+                    exit_time=exit_time,
+                    entry_basis=position.entry_basis,
+                    exit_basis=basis,
+                    notional=position.notional,
+                    funding_pnl=funding_pnl,
+                    basis_pnl=drag,
+                    realized_pnl=realized_pnl,
+                    exit_reason=reason.value,
+                )
+            )
+        except StorageError as exc:
+            log.error("trade ledger write failed — position is closed, this trade's audit row is missing", error=str(exc))
+            await self.alerter.send(
+                f"⚠️ {self.symbol}: trade closed successfully but the ledger write failed ({exc}) — "
+                "backfill this trade in the ledger manually"
+            )
         return True
 
     async def _maybe_exit(self, basis: Decimal, spot_quote, perp_quote, epoch_key: str) -> None:

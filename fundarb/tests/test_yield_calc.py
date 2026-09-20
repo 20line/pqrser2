@@ -9,6 +9,7 @@ from fundarb.research.fees import round_trip_cost_fraction
 from fundarb.research.yield_calc import (
     annualized_raw_rate,
     basis_fraction,
+    basis_pnl,
     compute_stability,
     net_apr,
 )
@@ -57,6 +58,22 @@ def test_basis_fraction() -> None:
     assert basis_fraction(Decimal("100"), Decimal("101")) == Decimal("0.01")
     assert basis_fraction(Decimal("100"), Decimal("99")) == Decimal("-0.01")
     assert basis_fraction(Decimal("0"), Decimal("100")) == Decimal(0)
+
+
+def test_basis_pnl_widening_basis_costs_the_short_perp_leg() -> None:
+    # entered at 0.001, basis widened to 0.006 -> the short perp leg loses
+    result = basis_pnl(Decimal("0.001"), Decimal("0.006"), Decimal("10000"))
+    assert result == Decimal("-50.0")
+
+
+def test_basis_pnl_narrowing_basis_profits_the_short_perp_leg() -> None:
+    # entered at 0.006, basis narrowed to 0.001 -> the short perp leg gains
+    result = basis_pnl(Decimal("0.006"), Decimal("0.001"), Decimal("10000"))
+    assert result == Decimal("50.0")
+
+
+def test_basis_pnl_unchanged_basis_is_zero() -> None:
+    assert basis_pnl(Decimal("0.002"), Decimal("0.002"), Decimal("10000")) == Decimal(0)
 
 
 def test_net_apr_subtracts_annualized_costs_and_basis_drag() -> None:

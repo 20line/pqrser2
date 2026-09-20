@@ -20,7 +20,7 @@ from fundarb.collect.storage import ParquetStorage
 from fundarb.config import FundarbConfig
 from fundarb.core.types import Market, Venue
 from fundarb.research.fees import round_trip_cost_fraction
-from fundarb.research.yield_calc import annualized_raw_rate, basis_fraction
+from fundarb.research.yield_calc import annualized_raw_rate, basis_fraction, basis_pnl
 
 log = structlog.get_logger(__name__)
 
@@ -159,10 +159,10 @@ class BacktestEngine:
             volume = spot_prices.volume_at(rate.funding_time) or Decimal(0)
             exit_slippage_cost = self._slippage_cost(position.notional, spot_p, volume)
             exit_fee_cost = fees_fraction / 2 * position.notional
-            basis_pnl = -(basis - position.entry_basis) * position.notional
+            basis_pnl_amount = basis_pnl(position.entry_basis, basis, position.notional)
             total_fee_cost = entry_fee_cost + exit_fee_cost
             total_slippage_cost = entry_slippage_cost + exit_slippage_cost
-            net_pnl = position.cumulative_funding_pnl + basis_pnl - total_fee_cost - total_slippage_cost
+            net_pnl = position.cumulative_funding_pnl + basis_pnl_amount - total_fee_cost - total_slippage_cost
             holding_days = Decimal((rate.funding_time - position.entry_time).total_seconds()) / Decimal(86400)
 
             result.trades.append(
@@ -175,7 +175,7 @@ class BacktestEngine:
                     exit_basis_bps=basis * 10_000,
                     notional=position.notional,
                     funding_pnl=position.cumulative_funding_pnl,
-                    basis_pnl=basis_pnl,
+                    basis_pnl=basis_pnl_amount,
                     fee_cost=total_fee_cost,
                     slippage_cost=total_slippage_cost,
                     net_pnl=net_pnl,
