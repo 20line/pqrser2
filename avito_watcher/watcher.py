@@ -9,7 +9,7 @@ import logging
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 from avito_watcher import captcha, notifications, parser
 from avito_watcher.db import Database
@@ -41,6 +41,7 @@ class WatcherEngine:
         scheduler: Scheduler,
         notifier: Notifier,
         settings_provider: Callable[[], GlobalSettings],
+        settings_update: Callable[..., Awaitable[GlobalSettings]],
         browser_profile_dir: Path,
         log_dir: Path,
         logger: Optional[logging.Logger] = None,
@@ -49,6 +50,11 @@ class WatcherEngine:
         self.scheduler = scheduler
         self.notifier = notifier
         self.settings_provider = settings_provider
+        # Должен указывать на SettingsCache.update (write-through к SQLite +
+        # обновление in-memory кэша), а не писать в db напрямую — иначе
+        # горячий путь (settings_provider = settings_cache.get) никогда не
+        # увидит изменение и пауза/возобновление не подействуют на цикл.
+        self.settings_update = settings_update
         self.browser_profile_dir = browser_profile_dir
         self.log_dir = log_dir
         self.logger = logger or logging.getLogger("avito_watcher")
@@ -221,7 +227,7 @@ class WatcherEngine:
 
     async def resume_all(self, manual: bool) -> None:
         await self.db.set_captcha_state(active=False, resume_at=None)
-        await self.db.update_settings(paused_all=False)
+        await self.settings_update(paused_all=False)
         if manual:
             await self.db.log_event("owner_action", None, "manual_resume_all")
             self.logger.info("Владелец вручную возобновил все проверки")
@@ -231,7 +237,7 @@ class WatcherEngine:
             await self.notifier.send_alert("✅ Тайм-аут истёк, возобновляю автоматические проверки.")
 
     async def pause_all_manual(self) -> None:
-        await self.db.update_settings(paused_all=True)
+        await self.settings_update(paused_all=True)
         await self.db.log_event("owner_action", None, "manual_pause_all")
 
     # ---------- errors (п.11 ТЗ) ----------
@@ -253,16 +259,23 @@ class WatcherEngine:
 
     async def _handle_layout_change(self, profile: Profile, html: str) -> None:
         already_broken = await self.db.get_layout_broken()
+        if already_broken:
+            # уже зафиксировано и задамплено раньше — не плодим на диске
+            # новый HTML-дамп на каждом цикле, пока поломка не починена
+            self.logger.error(
+                "Вёрстка Avito всё ещё не восстановилась (профиль #%s)", profile.id
+            )
+            await self.db.log_event("layout_change", profile.id, "still_broken")
+            return
         dump_path = dump_html_for_debug(self.log_dir, profile.id, html)
         self.logger.error(
             "Похоже, вёрстка Avito изменилась (профиль #%s). HTML сохранён в %s", profile.id, dump_path
         )
         await self.db.log_event("layout_change", profile.id, str(dump_path))
-        if not already_broken:
-            await self.db.set_layout_broken(True)
-            await self.notifier.send_alert(
-                "⚠️ Похоже, сайт изменился, проверка не работает. HTML сохранён для разбора, чиню."
-            )
+        await self.db.set_layout_broken(True)
+        await self.notifier.send_alert(
+            "⚠️ Похоже, сайт изменился, проверка не работает. HTML сохранён для разбора, чиню."
+        )
 
     async def _handle_layout_recovered_if_needed(self) -> None:
         if await self.db.get_layout_broken():

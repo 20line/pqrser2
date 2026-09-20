@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from avito_watcher.models import GlobalSettings, Profile
@@ -64,14 +64,6 @@ def edit_profile_menu(profile_id: int) -> InlineKeyboardMarkup:
 def cancel_only(callback_data: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="Отмена", callback_data=callback_data)
-    return b.as_markup()
-
-
-def skip_or_cancel(skip_data: str, cancel_data: str) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="Пропустить", callback_data=skip_data)
-    b.button(text="Отмена", callback_data=cancel_data)
-    b.adjust(2)
     return b.as_markup()
 
 

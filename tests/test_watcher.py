@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 
 from avito_watcher.db import Database
-from avito_watcher.models import GlobalSettings
 from avito_watcher.notifications import Notifier
 from avito_watcher.scheduler import Scheduler
+from avito_watcher.settings_cache import SettingsCache
 from avito_watcher.watcher import WatcherEngine
 
 CARD_HTML = """
@@ -57,19 +57,22 @@ async def db(tmp_path: Path):
     await database.close()
 
 
-async def make_watcher(db: Database, html_sequence: list[str]) -> tuple[WatcherEngine, Recorder]:
-    settings = GlobalSettings(owner_chat_id=42)
+async def make_watcher(db: Database, html_sequence: list[str]) -> tuple[WatcherEngine, Recorder, SettingsCache]:
+    settings_cache = SettingsCache(db)
+    await settings_cache.load()
     recorder = Recorder()
-    notifier = Notifier(recorder, db, lambda: settings)
-    scheduler = Scheduler(db, lambda: settings)
-    watcher = WatcherEngine(db, scheduler, notifier, lambda: settings, Path("/tmp/bp"), Path("/tmp/logs"))
+    notifier = Notifier(recorder, db, settings_cache.get)
+    scheduler = Scheduler(db, settings_cache.get)
+    watcher = WatcherEngine(
+        db, scheduler, notifier, settings_cache.get, settings_cache.update, Path("/tmp/bp"), Path("/tmp/logs")
+    )
     watcher.page = FakePage(html_sequence)
-    return watcher, recorder
+    return watcher, recorder, settings_cache
 
 
 async def test_first_pass_stores_baseline_without_notification(db: Database):
     pid = await db.add_profile("iPhone", "https://www.avito.ru/search?x=1", None, [])
-    watcher, recorder = await make_watcher(db, [CARD_HTML.format(price=35000)])
+    watcher, recorder, _ = await make_watcher(db, [CARD_HTML.format(price=35000)])
 
     await watcher.check_profile(pid)
 
@@ -84,7 +87,7 @@ async def test_price_increase_then_decrease_below_original_is_detected(db: Datab
     снижение сравнивалось со старой (заниженной) отметкой и терялось,
     если новая цена не опускалась ниже самой первой сохранённой."""
     pid = await db.add_profile("iPhone", "https://www.avito.ru/search?x=1", None, [])
-    watcher, recorder = await make_watcher(
+    watcher, recorder, _ = await make_watcher(
         db, [CARD_HTML.format(price=35000), CARD_HTML.format(price=40000), CARD_HTML.format(price=38000)]
     )
 
@@ -102,7 +105,7 @@ async def test_price_increase_then_decrease_below_original_is_detected(db: Datab
 
 async def test_price_increase_alone_sends_no_notification(db: Database):
     pid = await db.add_profile("iPhone", "https://www.avito.ru/search?x=1", None, [])
-    watcher, recorder = await make_watcher(
+    watcher, recorder, _ = await make_watcher(
         db, [CARD_HTML.format(price=35000), CARD_HTML.format(price=40000)]
     )
 
@@ -111,3 +114,23 @@ async def test_price_increase_alone_sends_no_notification(db: Database):
     await watcher.check_profile(pid)
 
     assert recorder.sent == []
+
+
+async def test_pause_all_manual_actually_blocks_the_hot_path(db: Database):
+    """Регрессия: pause_all_manual/resume_all раньше писали paused_all
+    напрямую в БД мимо SettingsCache, а _is_blocked_for_now (и вообще весь
+    горячий путь) читает settings_provider() = settings_cache.get() — кэш
+    никогда не обновлялся, и «⏸ Пауза всех» физически не влияла на цикл
+    проверок (и не поменяла бы подпись кнопки в меню)."""
+    watcher, _, settings_cache = await make_watcher(db, [])
+
+    assert settings_cache.get().paused_all is False
+    assert (await watcher._is_blocked_for_now()) is False
+
+    await watcher.pause_all_manual()
+    assert settings_cache.get().paused_all is True
+    assert (await watcher._is_blocked_for_now()) is True
+
+    await watcher.resume_all(manual=True)
+    assert settings_cache.get().paused_all is False
+    assert (await watcher._is_blocked_for_now()) is False

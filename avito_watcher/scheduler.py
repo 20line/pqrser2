@@ -14,7 +14,7 @@ import asyncio
 import random
 import time
 from datetime import datetime, time as dtime
-from typing import Awaitable, Callable
+from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from avito_watcher.db import Database

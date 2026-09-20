@@ -57,6 +57,7 @@ async def run(config: Optional[AppConfig] = None) -> None:
             scheduler=scheduler,
             notifier=notifier,
             settings_provider=settings_cache.get,
+            settings_update=settings_cache.update,
             browser_profile_dir=config.browser_profile_dir,
             log_dir=config.log_dir,
             logger=logger,
