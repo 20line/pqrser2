@@ -527,7 +527,11 @@ async def settings_receive_quiet_range(message: Message, state: FSMContext, sett
 
 
 @router.callback_query(F.data == "settings:advanced")
-async def cb_settings_advanced(cb: CallbackQuery, settings_cache: SettingsCache) -> None:
+async def cb_settings_advanced(cb: CallbackQuery, state: FSMContext, settings_cache: SettingsCache) -> None:
+    # Это ещё и цель кнопки «Отмена» для запроса бюджета запросов — без
+    # сброса состояния следующее случайное текстовое сообщение молча
+    # проглатывалось бы как ответ на уже отменённый вопрос.
+    await state.clear()
     await cb.message.edit_text(
         "⚙️ Дополнительные настройки:", reply_markup=keyboards.settings_advanced_menu(settings_cache.get())
     )
