@@ -76,14 +76,18 @@ class TradeLedger:
             schema=_SCHEMA,
         )
         path = self._path()
-        merged = pl.concat([pl.read_parquet(path), row]) if path.exists() else row
         try:
+            merged = pl.concat([pl.read_parquet(path), row]) if path.exists() else row
             self.ledger_dir.mkdir(parents=True, exist_ok=True)
             tmp_path = self.ledger_dir / f".tmp-{uuid.uuid4().hex}.parquet"
             merged.write_parquet(tmp_path)
             os.replace(tmp_path, path)
-        except OSError as exc:
-            raise StorageError(f"failed writing trade ledger {path}: {exc}") from exc
+        except (OSError, pl.exceptions.PolarsError) as exc:
+            # covers both filesystem failures (write_parquet/os.replace) and
+            # a corrupt/locked/unreadable existing file (read_parquet) —
+            # callers (execution/live_runner.py) match on StorageError alone
+            # and need every failure mode here normalized to it
+            raise StorageError(f"failed appending to trade ledger {path}: {exc}") from exc
 
     def read_all(self) -> pl.DataFrame:
         path = self._path()

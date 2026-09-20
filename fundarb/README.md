@@ -183,6 +183,17 @@ catches and alerts on any exception a cycle didn't already handle inline,
 rather than relying solely on `cli.py`'s loop (deliberately bare) or
 process supervision to recover.
 
+A fourth pass (same skill, `--level max`) caught one more gap in that
+ledger isolation: `TradeLedger.append`'s `except StorageError` only wrapped
+the *write* (`OSError` from `write_parquet`/`os.replace`), while the read
+of the existing file to merge the new row into ran unguarded — a corrupt
+or locked `trades.parquet` raised a raw `polars.exceptions.PolarsError`
+that `_execute_close`'s `except StorageError` didn't match, so it fell
+through to the generic unhandled-exception backstop instead of the
+specific "trade closed, ledger write failed, backfill manually" alert.
+Fixed by wrapping the read+merge+write sequence as one unit and catching
+`(OSError, pl.exceptions.PolarsError)`.
+
 ## Setup
 
 ```bash
@@ -222,15 +233,16 @@ the risk guard (position/exposure limits, order-frequency limiting, kill
 switch, auto delta-rebalance), the two-leg executor (partial fills,
 rollback on leg-2 failure, rollback-failure escalating to the kill switch),
 idempotent parquet storage, the scanner's liquidity filter (both legs, not
-just spot), and the live runner end to end against a fake adapter — entry
-(including the basis filter and leverage check), both exit rules, the
-position-level stop-loss (and its cascade into the daily-loss kill switch,
-including the kill-switch alert itself), auto rebalance, kill-switch
-auto-close, margin/rate-reversal alerting, the trade ledger (including
-isolation from a failing ledger write), metrics cleanup on close, the
-unhandled-exception backstop, and position persistence across a simulated
-restart. CI runs the suite on every push/PR touching `fundarb/**`
-(`.github/workflows/fundarb-tests.yml`).
+just spot), the trade ledger in isolation (round-trip, multiple appends,
+and a corrupt-file read failure normalizing to `StorageError`), and the
+live runner end to end against a fake adapter — entry (including the
+basis filter and leverage check), both exit rules, the position-level
+stop-loss (and its cascade into the daily-loss kill switch, including the
+kill-switch alert itself), auto rebalance, kill-switch auto-close,
+margin/rate-reversal alerting, isolation from a failing ledger write,
+metrics cleanup on close, the unhandled-exception backstop, and position
+persistence across a simulated restart. CI runs the suite on every push/PR
+touching `fundarb/**` (`.github/workflows/fundarb-tests.yml`).
 
 ## Known limitations (carried over from the spec)
 
